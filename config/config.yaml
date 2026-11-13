@@ -1,0 +1,48 @@
+# 系统配置文件
+
+# 音频捕获配置
+audio:
+  sample_rate: 16000  # 采样率 Hz
+  channels: 1         # 声道数
+  chunk_duration: 2   # 音频块时长（秒）
+  buffer_size: 20     # 队列缓冲大小（从10增加到30）
+  volume_threshold: 30  # 音量阈值，低于此值视为静音
+  max_consecutive_silence: 5  # 最大连续静音块数
+  adaptive_buffer: true  # 是否启用自适应缓冲区
+  
+# Whisper模型配置
+whisper:
+  model_size: "medium"  # tiny/base/small/medium/large
+  language: "zh"       # 语言代码
+  device: "cuda"       # cuda/cpu
+  fp16: true           # 是否使用半精度
+  without_timestamps: true  # 不返回时间戳以提高速度
+  beam_size: 1         # 束搜索大小，设为1提高速度
+  best_of: 1           # 最佳候选数，设为1提高速度
+
+# 翻译模型配置
+translation:
+  model_name: "tencent/HY-MT1.5-7B"
+  quantization: "none"  # none/4bit/8bit (腾讯模型建议使用none或8bit)
+  device_map: "auto"    # auto/cuda/cpu
+  max_new_tokens: 100   # 最大生成token数
+  temperature: 0.1      # 采样温度
+  target_languages:      # 目标翻译语言
+    - "en"  # 英语
+    - "zh"  # 中文
+
+# 弹幕展示配置
+danmaku:
+  window_width: 1920
+  window_height: 1080
+  font_size: 16
+  speed: 8000  # 弹幕移动时间(ms)
+  y_range: [800, 1000]  # Y轴随机范围
+  color: "white"
+  background_alpha: 0.5  # 背景透明度
+
+# 系统配置
+system:
+  log_level: "INFO"
+  max_workers: 4  # 最大工作线程数
+  retry_attempts: 3  # 重试次数

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行日志（loguru 每次运行生成，含本机音频设备信息）
+logs/
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+Thumbs.db
+.DS_Store
