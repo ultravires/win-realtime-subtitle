@@ -5,7 +5,7 @@ echo 启动实时字幕系统
 echo ========================================
 
 echo 检查依赖...
-python -c "import whisper, transformers, PyQt6" > nul 2>&1
+python -c "import faster_whisper, transformers, PyQt6" > nul 2>&1
 if %errorlevel% neq 0 (
     echo 错误: 依赖包未完全安装，请运行 install.bat
     pause

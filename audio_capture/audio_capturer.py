@@ -166,7 +166,7 @@ class AudioCapturer:
 
             threading.Thread(target=_drain_stderr, daemon=True).start()
             
-            chunk_size = self.config['audio']['sample_rate'] * 2 * self.config['audio']['chunk_duration']
+            chunk_size = int(self.config['audio']['sample_rate'] * 2 * self.config['audio']['chunk_duration'])
             last_process_time = time.time()
             
             while self.running and process.poll() is None:

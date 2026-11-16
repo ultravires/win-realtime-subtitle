@@ -1,58 +1,116 @@
-import whisper
-import torch
-import numpy as np
-import threading
 import queue
-from typing import Optional
-from loguru import logger
-from utils.helpers import sanitize_text
+import threading
 import time
+from typing import Optional
+
+import numpy as np
+from loguru import logger
+
+from utils.helpers import sanitize_text
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
 
 class WhisperTranscriber:
-    """Whisper语音转写器 - 优化版本"""
-    
+    """基于 faster-whisper 的语音转写器 - 低延迟窗口版本
+
+    低延迟策略（替代旧的 2s 固定分块 + 3 块批量缓冲）：
+    - 音频以小块（默认 0.5s）进入，按音量检测拼成"语音窗口"
+    - 触发转写的条件（满足其一即转写并清空窗口）：
+      1. 句尾静音达到 silence_flush_sec（说话人停顿 → 尽快出字幕）
+      2. 窗口时长达到 max_window_sec（连续说话时限制延迟上限）
+      3. 长时间没有新音频到达（捕获端在持续静音时会停止推数据）
+    - 达到 max_window_sec 时优先切在窗口内最近的静音点，避免切断词语
+    """
+
     def __init__(self, config: dict):
         self.config = config
+        wcfg = config['whisper']
         self.model = None
-        self.device = config['whisper']['device']
+        self.device = wcfg['device']
+        self.compute_type = wcfg.get('compute_type') or (
+            'int8_float16' if self.device == 'cuda' else 'int8')
+        self.model_size = wcfg['model_size']
+        self.language = wcfg['language']
+        self.beam_size = wcfg.get('beam_size', 1)
+
+        acfg = config['audio']
+        self.chunk_duration = acfg['chunk_duration']
+        self.volume_threshold = acfg.get('volume_threshold', 30)
+        self.max_window_sec = wcfg.get('max_window_sec', 4.0)
+        self.silence_flush_sec = wcfg.get('silence_flush_sec', 1.0)
+        self.min_audio_sec = 0.3  # 窗口太短不送模型，避免碎字幕
+
         self.running = False
         self.transcribe_thread: Optional[threading.Thread] = None
-        
-        # 性能优化配置
-        self.beam_size = config['whisper'].get('beam_size', 1)
-        self.best_of = config['whisper'].get('best_of', 1)
-        
+
+        # 语音窗口状态
+        self._window: list[np.ndarray] = []
+        self._window_samples = 0
+        self._window_start_ts: Optional[float] = None
+        self._last_chunk_ts: Optional[float] = None
+        self._last_text = ""  # 跨窗口去重
+
         # 如果没有GPU，强制使用CPU
-        if self.device == "cuda" and not torch.cuda.is_available():
+        if self.device == "cuda" and not self._cuda_available():
             logger.warning("CUDA不可用，切换到CPU模式")
             self.device = "cpu"
-        
-    def load_model(self):
-        """加载Whisper模型"""
+            self.compute_type = "int8"
+
+    @staticmethod
+    def _cuda_available() -> bool:
         try:
-            model_size = self.config['whisper']['model_size']
-            logger.info(f"正在加载Whisper {model_size} 模型...")
-            
-            self.model = whisper.load_model(
-                model_size, 
-                device=self.device
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
+
+    def load_model(self):
+        """加载 faster-whisper 模型"""
+        if WhisperModel is None:
+            raise RuntimeError("faster-whisper 未安装，请执行: pip install faster-whisper")
+        try:
+            logger.info(f"正在加载 faster-whisper {self.model_size} "
+                        f"(device={self.device}, compute_type={self.compute_type})...")
+            t0 = time.time()
+            self.model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
             )
-            
-            logger.info(f"Whisper模型加载完成，使用设备: {self.device}")
-            
+            logger.info(f"faster-whisper 模型加载完成，耗时 {time.time() - t0:.1f}s")
+            self._warmup()
         except Exception as e:
             logger.error(f"Whisper模型加载失败: {e}")
             raise
-    
+
+    def _warmup(self):
+        """空音频预热：触发 CUDA 内核/cuDNN 初始化，避免首条字幕背上 10-20s 的冷启动"""
+        try:
+            t0 = time.time()
+            segments, _ = self.model.transcribe(
+                np.zeros(16000, dtype=np.float32),
+                language=self.language, beam_size=self.beam_size)
+            _ = "".join(seg.text for seg in segments)  # 迭代才真正触发推理
+            logger.info(f"模型预热完成，耗时 {time.time() - t0:.1f}s")
+        except Exception as e:
+            logger.warning(f"模型预热失败（不影响运行）: {e}")
+
+    # ------------------------------------------------------------------ 服务生命周期
+
     def start_transcription(self, audio_queue: queue.Queue, text_queue: queue.Queue):
         """开始转写服务"""
         if self.running:
             logger.warning("转写服务已在运行")
             return
-            
+
         if self.model is None:
             self.load_model()
-            
+
+        self._reset_window()
         self.running = True
         self.transcribe_thread = threading.Thread(
             target=self._transcribe_loop,
@@ -60,157 +118,191 @@ class WhisperTranscriber:
             daemon=True
         )
         self.transcribe_thread.start()
-        logger.info("语音转写服务已启动")
-    
+        logger.info(f"语音转写服务已启动 (max_window={self.max_window_sec}s, "
+                    f"silence_flush={self.silence_flush_sec}s)")
+
     def stop_transcription(self):
         """停止转写服务"""
         self.running = False
         if self.transcribe_thread:
-            self.transcribe_thread.join(timeout=2)
+            self.transcribe_thread.join(timeout=3)
         logger.info("语音转写服务已停止")
-    
+
+    # ------------------------------------------------------------------ 主循环
+
     def _transcribe_loop(self, audio_queue: queue.Queue, text_queue: queue.Queue):
-        """转写主循环 - 优化版本"""
-        last_text = ""  # 用于去重
-        batch_buffer = []  # 批量处理缓冲区
-        batch_timeout = 0.5  # 批量超时时间（秒）
-        last_batch_time = time.time()
-        
+        """转写主循环：小块音频 → 语音窗口 → 条件触发转写"""
         while self.running:
             try:
-                # 获取音频数据（可能带元数据）
                 audio_item = audio_queue.get(timeout=0.1)
-                
-                # 处理不同格式的音频数据
-                if isinstance(audio_item, dict):
-                    # 新格式：带元数据的字典
-                    audio_data = audio_item['data']
-                    timestamp = audio_item.get('timestamp', time.time())
-                    is_silent = audio_item.get('silent', False)
-                    was_replaced = audio_item.get('replaced', False)
-                    
-                    if was_replaced:
-                        logger.debug("处理被替换的音频数据块")
-                else:
-                    # 旧格式：纯字节数据
-                    audio_data = audio_item
-                    timestamp = time.time()
-                    is_silent = False
-                
-                # 转换音频数据格式
-                audio_np = self._convert_audio_data(audio_data)
-                
-                if audio_np is not None:
-                    # 如果是静音且不是替换数据，则可以选择跳过
-                    if is_silent and not was_replaced:
-                        logger.debug("跳过静音数据块")
-                        continue
-                    
-                    # 添加到批量缓冲区
-                    batch_buffer.append({
-                        'audio': audio_np,
-                        'timestamp': timestamp,
-                        'original_data': audio_data
-                    })
-                    
-                    # 检查是否应该处理批次
-                    current_time = time.time()
-                    should_process = (
-                        len(batch_buffer) >= 3 or  # 缓冲区满
-                        (current_time - last_batch_time) >= batch_timeout or  # 超时
-                        audio_queue.qsize() < 2  # 队列空闲
-                    )
-                    
-                    if should_process and batch_buffer:
-                        self._process_batch(batch_buffer, text_queue, last_text)
-                        batch_buffer.clear()
-                        last_batch_time = current_time
-                        last_text = ""  # 重置去重
-                
             except queue.Empty:
-                # 队列为空时处理剩余的批量数据
-                if batch_buffer:
-                    self._process_batch(batch_buffer, text_queue, last_text)
-                    batch_buffer.clear()
-                    last_batch_time = time.time()
+                # 队列无新数据：如果窗口里有话没转完，按"静音超时"触发转写
+                # （捕获端持续静音时不再推送数据，只能靠这里兜底）
+                if self._window and self._last_chunk_ts is not None:
+                    if time.time() - self._last_chunk_ts >= self.silence_flush_sec:
+                        self._flush_window(text_queue)
                 continue
             except Exception as e:
-                logger.error(f"转写过程中发生错误: {e}")
-                batch_buffer.clear()  # 清空缓冲区
+                logger.error(f"转写循环异常: {e}")
                 continue
-    
-    def _process_batch(self, batch_buffer: list, text_queue: queue.Queue, last_text: str):
-        """处理音频批处理"""
-        if not batch_buffer:
+
+            try:
+                self._handle_chunk(audio_item, text_queue)
+            except Exception as e:
+                logger.error(f"处理音频块失败: {e}")
+                self._reset_window()
+
+    def _handle_chunk(self, audio_item, text_queue: queue.Queue):
+        """处理单个音频块：音量判定 → 拼窗 / 累计静音"""
+        if isinstance(audio_item, dict):
+            audio_data = audio_item['data']
+            timestamp = audio_item.get('timestamp', time.time())
+        else:
+            audio_data = audio_item
+            timestamp = time.time()
+
+        audio_np = self._convert_audio_data(audio_data)
+        if audio_np is None or len(audio_np) == 0:
             return
-            
-        try:
-            # 合并音频数据进行批量转写
-            combined_audio = np.concatenate([item['audio'] for item in batch_buffer])
-            
-            # 执行转写
-            text = self._transcribe_audio(combined_audio)
-            
-            if text and text != last_text:
-                # 清理文本
-                clean_text = sanitize_text(text)
-                if len(clean_text) > 2:  # 过滤太短的文本
-                    logger.info(f"批量转写结果: {clean_text}")
-                    try:
-                        # 添加时间戳信息
-                        result_with_metadata = {
-                            'text': clean_text,
-                            'timestamp': time.time(),
-                            'batch_size': len(batch_buffer),
-                            'first_timestamp': batch_buffer[0]['timestamp']
-                        }
-                        text_queue.put(result_with_metadata, timeout=0.1)
-                    except queue.Full:
-                        logger.warning("文本队列已满，丢弃结果")
-                        
-        except Exception as e:
-            logger.error(f"批量处理失败: {e}")
-    
+
+        now = time.time()
+        self._last_chunk_ts = now
+
+        # 自行计算音量（不依赖捕获端的 silent 标记，块粒度一致）
+        peak = float(np.max(np.abs(audio_np * 32768.0)))
+        is_speech = peak > self.volume_threshold
+
+        if self._window_start_ts is None:
+            self._window_start_ts = timestamp
+
+        if is_speech:
+            self._window.append(audio_np)
+            self._window_samples += len(audio_np)
+        else:
+            if self._window:
+                # 句中停顿保留在窗口里（自然语流），并累计静音时长
+                self._window.append(audio_np)
+                self._window_samples += len(audio_np)
+                window_sec = self._window_samples / 16000.0
+                if window_sec >= self.max_window_sec:
+                    self._flush_window(text_queue)
+                    return
+                if window_sec - self._speech_samples() / 16000.0 >= self.silence_flush_sec:
+                    # 句尾静音够了 → 触发转写
+                    self._flush_window(text_queue)
+                    return
+            # 窗口为空时静音直接丢弃，不占用模型时间
+            return
+
+        # 连续说话达到窗口上限 → 转写（优先切在静音点）
+        if self._window_samples / 16000.0 >= self.max_window_sec:
+            self._flush_window(text_queue, cut_at_silence=True)
+
+    # ------------------------------------------------------------------ 窗口与转写
+
+    def _speech_samples(self) -> int:
+        """窗口内语音样本数（非静音块）"""
+        return sum(len(a) for a in self._window
+                   if float(np.max(np.abs(a * 32768.0))) > self.volume_threshold)
+
+    def _reset_window(self):
+        self._window = []
+        self._window_samples = 0
+        self._window_start_ts = None
+
+    def _flush_window(self, text_queue: queue.Queue, cut_at_silence: bool = False):
+        """转写当前窗口并清空；cut_at_silence 时只转写到最近静音点，剩余部分留下轮"""
+        window = self._window
+        window_start = self._window_start_ts
+        if not window:
+            self._reset_window()
+            return
+
+        if cut_at_silence:
+            # 在窗口内找最近的静音块边界，把窗口一分为二
+            cut_idx = self._last_silence_boundary(window)
+            if cut_idx is not None and cut_idx > 0:
+                head = window[:cut_idx]
+                tail = window[cut_idx:]
+                head_samples = sum(len(a) for a in head)
+                if head_samples / 16000.0 >= self.min_audio_sec:
+                    self._emit_transcription(head, window_start, text_queue)
+                self._window = tail
+                self._window_samples = sum(len(a) for a in tail)
+                return  # 尾部留给下一轮继续积累
+            # 没有可用静音点，整窗转写
+            self._emit_transcription(window, window_start, text_queue)
+            self._reset_window()
+            return
+
+        self._emit_transcription(window, window_start, text_queue)
+        self._reset_window()
+
+    def _last_silence_boundary(self, window: list[np.ndarray]) -> Optional[int]:
+        """返回最后一个静音块的起始下标（作为切分点）"""
+        boundary = None
+        for i, a in enumerate(window):
+            if float(np.max(np.abs(a * 32768.0))) <= self.volume_threshold:
+                boundary = i
+        return boundary
+
+    def _emit_transcription(self, window: list[np.ndarray], window_start: Optional[float],
+                            text_queue: queue.Queue):
+        """转写窗口并投递结果"""
+        audio_np = np.concatenate(window)
+        duration = len(audio_np) / 16000.0
+        if duration < self.min_audio_sec:
+            return
+
+        t0 = time.time()
+        text = self._transcribe_audio(audio_np)
+        infer_ms = (time.time() - t0) * 1000
+
+        if text and text != self._last_text:
+            clean_text = sanitize_text(text)
+            if len(clean_text) > 1:
+                self._last_text = clean_text
+                logger.info(f"转写结果 ({duration:.1f}s 音频, {infer_ms:.0f}ms): {clean_text}")
+                try:
+                    text_queue.put({
+                        'text': clean_text,
+                        'timestamp': time.time(),
+                        'window_sec': duration,
+                        'first_timestamp': window_start if window_start is not None else time.time(),
+                    }, timeout=0.5)
+                except queue.Full:
+                    logger.warning("文本队列已满，丢弃结果")
+        elif text == self._last_text and text:
+            logger.debug(f"跨窗口重复结果已过滤: {text}")
+
     def _convert_audio_data(self, audio_data: bytes) -> Optional[np.ndarray]:
-        """转换音频数据格式"""
+        """s16le PCM → float32 [-1, 1]"""
         try:
-            # 将二进制PCM数据转为numpy数组
-            audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-            return audio_np
+            return np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
         except Exception as e:
             logger.error(f"音频数据转换失败: {e}")
             return None
-    
+
     def _transcribe_audio(self, audio_np: np.ndarray) -> str:
-        """转写单段音频 - 优化版本"""
+        """执行转写"""
         try:
-            # 准备转写参数
-            transcribe_params = {
-                'verbose': False,
-                'task': 'transcribe',
-                'without_timestamps': self.config['whisper']['without_timestamps'],
-                'language': self.config['whisper']['language'],
-                'beam_size': self.beam_size,
-                'best_of': self.best_of
-            }
-            
-            # GPU加速参数
-            if self.device == "cuda" and self.config['whisper']['fp16']:
-                transcribe_params['fp16'] = True
-            
-            # 执行转写
-            result = self.model.transcribe(audio_np, **transcribe_params)
-            return result.get("text", "").strip()
-            
+            segments, info = self.model.transcribe(
+                audio_np,
+                language=self.language,
+                task='transcribe',
+                beam_size=self.beam_size,
+                vad_filter=True,               # 过滤窗口内残留静音
+                condition_on_previous_text=False,  # 防止短窗口间的幻觉/复读
+            )
+            return "".join(seg.text for seg in segments).strip()
         except Exception as e:
             logger.error(f"音频转写失败: {e}")
             return ""
-    
+
     def transcribe_sync(self, audio_data: bytes) -> str:
         """同步转写方法（用于测试）"""
         if self.model is None:
             self.load_model()
-            
         audio_np = self._convert_audio_data(audio_data)
         if audio_np is not None:
             return self._transcribe_audio(audio_np)

@@ -4,32 +4,42 @@
 audio:
   sample_rate: 16000  # 采样率 Hz
   channels: 1         # 声道数
-  chunk_duration: 2   # 音频块时长（秒）
+  chunk_duration: 0.5   # 音频块时长（秒）—— 小块便于低延迟拼窗
   buffer_size: 20     # 队列缓冲大小（从10增加到30）
   volume_threshold: 30  # 音量阈值，低于此值视为静音
   max_consecutive_silence: 5  # 最大连续静音块数
   adaptive_buffer: true  # 是否启用自适应缓冲区
   
-# Whisper模型配置
+# 语音识别配置
 whisper:
-  model_size: "medium"  # tiny/base/small/medium/large
-  language: "zh"       # 语言代码
-  device: "cuda"       # cuda/cpu
-  fp16: true           # 是否使用半精度
-  without_timestamps: true  # 不返回时间戳以提高速度
-  beam_size: 1         # 束搜索大小，设为1提高速度
-  best_of: 1           # 最佳候选数，设为1提高速度
+  backend: "sherpa-stream"  # faster-whisper（离线窗口式）/ sherpa-stream（真流式，低延迟，默认推荐）
+  model_size: "medium"    # tiny/base/small/medium/large（仅 faster-whisper 生效）
+  language: "zh"          # 语言代码
+  device: "cuda"          # cuda/cpu
+  compute_type: "int8_float16"  # int8_float16 省显存且快；CPU 用 int8
+  max_window_sec: 4.0     # 连续说话时单窗口最长秒数（延迟上限）
+  silence_flush_sec: 1.0  # 句尾静音多久触发转写（停顿后出字幕的延迟）
+  beam_size: 1            # 束搜索大小，设为1提高速度（仅 faster-whisper 生效）
+
+# 流式识别配置（backend: sherpa-stream 时生效）
+streaming:
+  model_dir: "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+  decoding_method: "modified_beam_search"
+  rule1_min_trailing_silence: 1.0  # 句尾停顿1秒→出字幕
+  rule2_min_trailing_silence: 2.5  # 长静音强制断句
+  provider: "cpu"         # cpu 即可实时；cuda 可选
+  num_threads: 2
+  punctuation_model: "models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12"  # 空串则不加载
 
 # 翻译模型配置
 translation:
   model_name: "tencent/HY-MT1.5-7B"
-  quantization: "none"  # none/4bit/8bit (腾讯模型建议使用none或8bit)
+  quantization: "none"  # 注意：HY-MT 为 trust_remote_code 自定义模型，bnb 4bit/8bit 会被静默忽略（实测仍 fp16 ~14.8GB）；显存不足时只能换更小的翻译模型
   device_map: "auto"    # auto/cuda/cpu
   max_new_tokens: 100   # 最大生成token数
   temperature: 0.1      # 采样温度
-  target_languages:      # 目标翻译语言
+  target_languages:      # 目标翻译语言（源语言为 zh，zh→zh 无意义已移除，翻译耗时减半）
     - "en"  # 英语
-    - "zh"  # 中文
 
 # 弹幕展示配置
 danmaku:

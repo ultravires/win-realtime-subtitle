@@ -4,7 +4,8 @@ sounddevice==0.4.6
 pyaudio==0.2.12
 
 # 语音识别
-openai-whisper==20231117
+faster-whisper==1.2.1
+sherpa-onnx==2.0.1
 
 # 翻译模型
 transformers==4.36.0

@@ -14,6 +14,7 @@ from loguru import logger
 from utils.helpers import load_config, setup_logging
 from audio_capture.audio_capturer import AudioCapturer
 from transcription.whisper_transcriber import WhisperTranscriber
+from transcription.streaming_transcriber import StreamingTranscriber
 from translation.translator import TencentTranslator
 from translation.simple_translator import SimpleTranslator
 from danmaku.danmaku_window import DanmakuManager
@@ -28,9 +29,15 @@ class RealtimeSubtitleSystem:
         # 设置日志
         setup_logging(self.config['system']['log_level'])
         
-        # 初始化各模块
+        # 初始化各模块（按配置选择识别后端）
         self.audio_capturer = AudioCapturer(self.config)
-        self.whisper_transcriber = WhisperTranscriber(self.config)
+        backend = self.config['whisper'].get('backend', 'faster-whisper')
+        if backend == 'sherpa-stream':
+            self.whisper_transcriber = StreamingTranscriber(self.config)
+            logger.info("识别后端: sherpa-onnx 真流式")
+        else:
+            self.whisper_transcriber = WhisperTranscriber(self.config)
+            logger.info("识别后端: faster-whisper 窗口式")
         
         # 尝试初始化腾讯翻译器，失败则使用简化版
         self.translator = self._init_translator()

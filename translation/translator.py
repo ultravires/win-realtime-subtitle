@@ -1,6 +1,7 @@
 import torch
 import threading
 import queue
+import time
 from typing import Dict, List, Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from loguru import logger
@@ -84,9 +85,13 @@ class TencentTranslator:
             
             # 特殊处理腾讯模型可能需要的额外参数
             if "HY-MT" in model_name:
-                model_kwargs.pop('quantization_config', None)  # 移除可能不兼容的参数
-                model_kwargs['torch_dtype'] = torch.float16
-                logger.info("针对腾讯HY模型使用特殊加载配置")
+                if quantization in ("4bit", "8bit"):
+                    # 显式配置了量化：尊重配置（8bit 约 7.5GB，显存紧张时避免溢出到共享内存变慢 10 倍）
+                    logger.info(f"HY-MT 使用 {quantization} 量化加载")
+                else:
+                    model_kwargs.pop('quantization_config', None)
+                    model_kwargs['torch_dtype'] = torch.float16
+                    logger.info("针对腾讯HY模型使用特殊加载配置")
             
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -94,6 +99,14 @@ class TencentTranslator:
             )
             
             logger.info("翻译模型加载完成")
+
+            # 预热：首条字幕不应背上生成内核的冷启动开销
+            try:
+                t0 = time.time()
+                self.translate_text("你好。", ['en'])
+                logger.info(f"翻译模型预热完成，耗时 {time.time() - t0:.1f}s")
+            except Exception as e:
+                logger.warning(f"翻译预热失败（不影响运行）: {e}")
             
         except Exception as e:
             logger.error(f"翻译模型加载失败: {e}")
@@ -128,8 +141,16 @@ class TencentTranslator:
         """翻译主循环"""
         while self.running:
             try:
-                # 获取待翻译文本
-                text = text_queue.get(timeout=1.0)
+                # 获取待翻译文本（兼容纯文本与带元数据的 dict 两种格式）
+                item = text_queue.get(timeout=1.0)
+                if not item:
+                    continue
+                first_ts = None
+                if isinstance(item, dict):
+                    first_ts = item.get('first_timestamp')
+                    text = item.get('text', '')
+                else:
+                    text = item
                 if not text:
                     continue
                 
@@ -142,6 +163,8 @@ class TencentTranslator:
                     'translations': translations,
                     'timestamp': self._get_current_timestamp()
                 }
+                if first_ts is not None:
+                    translation_result['first_timestamp'] = first_ts
                 
                 logger.info(f"翻译完成: {text} -> {list(translations.values())}")
                 

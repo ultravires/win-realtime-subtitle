@@ -7,6 +7,8 @@ venv/
 
 # 运行日志（loguru 每次运行生成，含本机音频设备信息）
 logs/
+models/
+test_audio/
 
 # IDE
 .idea/
