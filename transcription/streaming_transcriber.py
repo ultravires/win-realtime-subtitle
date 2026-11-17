@@ -231,14 +231,21 @@ class StreamingTranscriber:
         if len(clean) > 1 and clean != self._last_text:
             self._last_text = clean
             logger.info(f"流式转写结果: {clean}")
+            item = {
+                'text': clean,
+                'timestamp': time.time(),
+                'first_timestamp': timestamp,
+            }
             try:
-                text_queue.put({
-                    'text': clean,
-                    'timestamp': time.time(),
-                    'first_timestamp': timestamp,
-                }, timeout=0.5)
+                text_queue.put(item, timeout=0.5)
             except queue.Full:
-                logger.warning("文本队列已满，丢弃结果")
+                # 实时字幕保新弃旧：挤掉最旧的待翻译结果，保住当前最新一条
+                try:
+                    text_queue.get_nowait()
+                    text_queue.put(item, timeout=0.5)
+                    logger.warning("文本队列已满，已丢弃最旧字幕以保住最新结果")
+                except Exception:
+                    logger.warning("文本队列已满，丢弃结果")
 
     def _convert_audio_data(self, audio_data: bytes) -> Optional[np.ndarray]:
         try:

@@ -77,6 +77,11 @@ class RealtimeSubtitleSystem:
         
     def _init_translator(self):
         """初始化翻译器，带错误处理"""
+        # 翻译器类在 __init__ 的计时导入块中已随模块加载（sys.modules 已缓存），
+        # 但 from import 在函数体内绑定的是局部名，跨方法不可见，
+        # 此处需重新绑定到本方法作用域（缓存命中，无额外导入耗时）
+        from translation.translator import TencentTranslator
+        from translation.simple_translator import SimpleTranslator
         try:
             # 首先尝试腾讯翻译器
             translator = TencentTranslator(self.config)
@@ -107,7 +112,6 @@ class RealtimeSubtitleSystem:
         """启动系统"""
         try:
             logger.info("正在启动实时字幕系统...")
-            import time
             self.performance_stats['start_time'] = time.time()
             
             # 启动音频捕获
@@ -119,22 +123,27 @@ class RealtimeSubtitleSystem:
                 self.text_queue
             )
             
+            # 运行标志必须在启动任何 worker 线程之前置位：
+            # 所有消费线程都是 while self.running 循环，不置位会导致线程
+            # 启动即退出、text_queue 无人消费直至打满、转写结果被丢弃
+            self.running = True
+
             # 启动翻译服务（如果有翻译器）
             if self.translator is not None:
                 self.translator.start_translation(
-                    self.text_queue, 
+                    self.text_queue,
                     self.translation_queue
                 )
             else:
                 # 无翻译模式：直接将文本转发到翻译队列
                 self._start_passthrough_mode()
-            
-            # 启动弹幕展示（在主线程中）
-            # self._start_danmaku_thread()
-            
-            # self.running = True
-            # logger.info("实时字幕系统启动完成")
-            
+
+            # 字幕显示：消费 translation_queue 并输出到控制台。
+            # 弹幕窗口模式未启用——DanmakuManager.start() 的 Qt 事件循环需占用主线程，
+            # 与 input() 控制台模式互斥。无论哪种模式 translation_queue 都必须有
+            # 消费者，否则打满后背压会层层传导回 text_queue，字幕被丢弃。
+            self._start_display_worker()
+
             # 启动监控线程
             self._start_monitor_thread()
 
@@ -168,16 +177,55 @@ class RealtimeSubtitleSystem:
                             'translations': {'en': text, 'ja': text, 'ko': text},
                             'timestamp': self._get_current_timestamp()
                         }
-                        self.translation_queue.put(result, timeout=0.1)
+                        try:
+                            self.translation_queue.put(result, timeout=0.1)
+                        except queue.Full:
+                            logger.warning("翻译队列已满，丢弃结果")
                 except queue.Empty:
                     continue
                 except Exception as e:
                     logger.error(f"直通模式错误: {e}")
-        
+
         thread = threading.Thread(target=passthrough_worker, daemon=True)
         thread.start()
         self.threads.append(thread)
         logger.info("启动直通模式（无翻译）")
+
+    def _start_display_worker(self):
+        """字幕显示线程：消费 translation_queue，在控制台输出最终字幕。
+
+        弹幕窗口模式需要主线程跑 Qt 事件循环，与控制台输入模式互斥；
+        当前以控制台显示替代。若日后启用弹幕窗口，可由弹幕线程接替本线程。
+        """
+        def display_worker():
+            while self.running:
+                try:
+                    result = self.translation_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logger.error(f"显示线程取数失败: {e}")
+                    continue
+                try:
+                    if isinstance(result, dict):
+                        original = result.get('original', '')
+                        translations = result.get('translations', {})
+                        # 原文在前，翻译按序拼接；直通模式下翻译与原文相同，去重后只显示一条
+                        parts = [original] + [
+                            v for v in translations.values() if v and v != original
+                        ]
+                        line = ' | '.join(dict.fromkeys(p for p in parts if p))
+                    else:
+                        line = str(result)
+                    if line:
+                        logger.info(f"显示字幕: {line}")
+                except Exception as e:
+                    logger.error(f"显示字幕失败: {e}")
+
+        thread = threading.Thread(target=display_worker, daemon=True)
+        thread.start()
+        self.threads.append(thread)
+        logger.info("字幕显示线程已启动（控制台模式）")
     
     def _start_danmaku_thread(self):
         """启动弹幕线程"""
@@ -263,7 +311,7 @@ class RealtimeSubtitleSystem:
             'audio_capture': self.audio_capturer.running,
             'transcription': self.whisper_transcriber.running,
             'translation': self.translator.running if self.translator else True,
-            'danmaku': self.danmaku_manager.running
+            # 弹幕窗口模式未启用（需主线程跑 Qt 事件循环），不作为异常上报
         }
         
         for module, status in statuses.items():

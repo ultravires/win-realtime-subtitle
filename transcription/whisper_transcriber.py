@@ -263,15 +263,22 @@ class WhisperTranscriber:
             if len(clean_text) > 1:
                 self._last_text = clean_text
                 logger.info(f"转写结果 ({duration:.1f}s 音频, {infer_ms:.0f}ms): {clean_text}")
+                item = {
+                    'text': clean_text,
+                    'timestamp': time.time(),
+                    'window_sec': duration,
+                    'first_timestamp': window_start if window_start is not None else time.time(),
+                }
                 try:
-                    text_queue.put({
-                        'text': clean_text,
-                        'timestamp': time.time(),
-                        'window_sec': duration,
-                        'first_timestamp': window_start if window_start is not None else time.time(),
-                    }, timeout=0.5)
+                    text_queue.put(item, timeout=0.5)
                 except queue.Full:
-                    logger.warning("文本队列已满，丢弃结果")
+                    # 实时字幕保新弃旧：挤掉最旧的待翻译结果，保住当前最新一条
+                    try:
+                        text_queue.get_nowait()
+                        text_queue.put(item, timeout=0.5)
+                        logger.warning("文本队列已满，已丢弃最旧字幕以保住最新结果")
+                    except Exception:
+                        logger.warning("文本队列已满，丢弃结果")
         elif text == self._last_text and text:
             logger.debug(f"跨窗口重复结果已过滤: {text}")
 
