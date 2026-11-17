@@ -77,11 +77,22 @@ class TencentTranslator:
                     logger.warning("bitsandbytes未安装，使用float16精度")
                     model_kwargs['torch_dtype'] = torch.float16
             
-            # 加载模型和分词器
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, 
-                trust_remote_code=True
-            )
+            # 加载分词器（本地缓存优先：联网探测 huggingface.co 可能卡住数十秒到数分钟）
+            t_tok = time.time()
+            logger.info("正在加载分词器（本地缓存优先）...")
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+            except Exception:
+                logger.warning("分词器本地缓存未命中，尝试联网获取...")
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True
+                )
+            logger.info(f"分词器加载完成，耗时 {time.time() - t_tok:.1f}s")
             
             # 特殊处理腾讯模型可能需要的额外参数
             if "HY-MT" in model_name:
@@ -93,12 +104,21 @@ class TencentTranslator:
                     model_kwargs['torch_dtype'] = torch.float16
                     logger.info("针对腾讯HY模型使用特殊加载配置")
             
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                **model_kwargs
-            )
-            
-            logger.info("翻译模型加载完成")
+            t_model = time.time()
+            logger.info("正在加载模型权重（fp16 约 15GB，需 30 秒到数分钟，取决于磁盘速度；期间无输出属正常）...")
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    local_files_only=True,
+                    **model_kwargs
+                )
+            except Exception:
+                logger.warning("模型权重本地缓存未命中，尝试联网获取...")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    **model_kwargs
+                )
+            logger.info(f"翻译模型加载完成，耗时 {time.time() - t_model:.1f}s")
 
             # 预热：首条字幕不应背上生成内核的冷启动开销
             try:

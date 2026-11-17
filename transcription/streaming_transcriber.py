@@ -84,6 +84,7 @@ class StreamingTranscriber:
         if not os.path.isfile(tokens):
             raise RuntimeError(f"找不到 tokens.txt: {tokens}")
 
+        logger.info("正在加载流式识别模型（encoder/decoder/joiner，随后加载标点模型）...")
         self.recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             tokens=tokens,
             encoder=find('encoder', prefer_int8=True),

@@ -9,15 +9,14 @@ import threading
 import queue
 import signal
 import sys
+import time
 from loguru import logger
 
 from utils.helpers import load_config, setup_logging
-from audio_capture.audio_capturer import AudioCapturer
-from transcription.whisper_transcriber import WhisperTranscriber
-from transcription.streaming_transcriber import StreamingTranscriber
-from translation.translator import TencentTranslator
-from translation.simple_translator import SimpleTranslator
-from danmaku.danmaku_window import DanmakuManager
+
+# 注意：重型依赖（torch / transformers / faster-whisper / sherpa-onnx / PyQt6）
+# 不在模块顶部导入，而是在 RealtimeSubtitleSystem.__init__ 中、日志系统就绪后
+# 带计时导入——否则启动最初十几秒到几十秒完全无输出，看起来像卡死。
 
 class RealtimeSubtitleSystem:
     """实时字幕系统主类 - 优化版本"""
@@ -25,10 +24,22 @@ class RealtimeSubtitleSystem:
     def __init__(self, config_path: str = "config/config.yaml"):
         # 加载配置
         self.config = load_config(config_path)
-        
-        # 设置日志
+
+        # 设置日志（尽早，保证后续每个阶段都有输出）
         setup_logging(self.config['system']['log_level'])
-        
+        logger.info(f"配置加载完成 ({config_path})")
+
+        # 重型依赖带计时导入
+        t0 = time.time()
+        logger.info("正在导入深度学习依赖（torch / transformers / sherpa-onnx / PyQt6），约 15-40 秒...")
+        from audio_capture.audio_capturer import AudioCapturer
+        from transcription.whisper_transcriber import WhisperTranscriber
+        from transcription.streaming_transcriber import StreamingTranscriber
+        from translation.translator import TencentTranslator
+        from translation.simple_translator import SimpleTranslator
+        from danmaku.danmaku_window import DanmakuManager
+        logger.info(f"依赖导入完成，耗时 {time.time() - t0:.1f}s")
+
         # 初始化各模块（按配置选择识别后端）
         self.audio_capturer = AudioCapturer(self.config)
         backend = self.config['whisper'].get('backend', 'faster-whisper')
