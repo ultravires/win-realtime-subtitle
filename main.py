@@ -64,6 +64,12 @@ class RealtimeSubtitleSystem:
         self._stopped = False
         self._fully_stopped = False
         self.threads = []
+
+        # GUI 模式状态：display_mode=danmaku 时主线程被 Qt 事件循环占用，
+        # Ctrl+C / 回车退出均转为置标志 + 线程安全地请求退出事件循环
+        self._gui_mode = False
+        self._signal_stop = False
+        self._stdin_stop = False
         
         # 性能监控
         self.performance_stats = {
@@ -103,10 +109,19 @@ class RealtimeSubtitleSystem:
                 return None
     
     def _signal_handler(self, signum, frame):
-        """信号处理器"""
+        """信号处理器。
+
+        GUI 模式下主线程阻塞在 Qt 事件循环内部（异常无法从 C 层传递出来），
+        此处只置退出标志并线程安全地请求退出事件循环；事件循环退出后，
+        _wait_for_shutdown 在主线程完成完整清理。
+        """
         logger.info(f"接收到信号 {signum}，正在关闭系统...")
-        self.stop()
-        sys.exit(0)
+        if self._gui_mode:
+            self._signal_stop = True
+            self.danmaku_manager.request_quit()
+        else:
+            self.stop()
+            sys.exit(0)
     
     def start(self):
         """启动系统"""
@@ -138,11 +153,16 @@ class RealtimeSubtitleSystem:
                 # 无翻译模式：直接将文本转发到翻译队列
                 self._start_passthrough_mode()
 
-            # 字幕显示：消费 translation_queue 并输出到控制台。
-            # 弹幕窗口模式未启用——DanmakuManager.start() 的 Qt 事件循环需占用主线程，
-            # 与 input() 控制台模式互斥。无论哪种模式 translation_queue 都必须有
-            # 消费者，否则打满后背压会层层传导回 text_queue，字幕被丢弃。
-            self._start_display_worker()
+            # 字幕显示：按配置选择桌面弹幕 GUI 或控制台日志。
+            # 无论哪种模式 translation_queue 都必须有消费者，否则打满后
+            # 背压会层层传导回 text_queue，字幕被丢弃。
+            if self.config['system'].get('display_mode', 'danmaku') == 'danmaku':
+                # 必须在启动消费线程前置位：信号处理器按此选择关闭路径
+                self._gui_mode = True
+                self._start_danmaku_gui()
+            else:
+                self._gui_mode = False
+                self._start_display_worker()
 
             # 启动监控线程
             self._start_monitor_thread()
@@ -191,12 +211,29 @@ class RealtimeSubtitleSystem:
         self.threads.append(thread)
         logger.info("启动直通模式（无翻译）")
 
+    def _start_danmaku_gui(self):
+        """启动弹幕 GUI 显示。
+
+        DanmakuManager.start() 在主线程创建 QApplication 与弹幕窗口（非阻塞，
+        不运行事件循环）；事件循环由 _wait_for_shutdown → run_event_loop()
+        启动并占用主线程，退出条件（Ctrl+C / 回车）由循环内轮询定时器检测。
+        本方法额外启动弹幕消费线程，把 translation_queue 的结果投喂给弹幕窗口。
+        GUI 启动失败（如无显示环境）时自动回退到控制台显示模式。
+        """
+        try:
+            self.danmaku_manager.start()
+        except Exception as e:
+            logger.warning(f"弹幕 GUI 启动失败: {e}，回退到控制台显示模式")
+            self._gui_mode = False
+            self._start_display_worker()
+            return
+        self._start_danmaku_thread()
+        logger.info("字幕显示: 弹幕窗口模式（GUI）")
+
     def _start_display_worker(self):
         """字幕显示线程：消费 translation_queue，在控制台输出最终字幕。
 
-        弹幕窗口模式需要主线程跑 Qt 事件循环，与控制台输入模式互斥；
-        当前以控制台显示替代。若日后启用弹幕窗口，可由弹幕线程接替本线程。
-        """
+        作为 display_mode: console 的显示方式，也是弹幕 GUI 启动失败时的回退。"""
         def display_worker():
             while self.running:
                 try:
@@ -228,14 +265,17 @@ class RealtimeSubtitleSystem:
         logger.info("字幕显示线程已启动（控制台模式）")
     
     def _start_danmaku_thread(self):
-        """启动弹幕线程"""
+        """启动弹幕消费线程：translation_queue → 弹幕窗口（GUI 显示）"""
         def danmaku_worker():
             try:
                 while self.running:
                     try:
                         # 从翻译队列获取数据
                         translation_data = self.translation_queue.get(timeout=1.0)
-                        # 添加到弹幕系统
+                        # 非 dict 数据（异常路径）包装成弹幕格式，避免静默丢失
+                        if not isinstance(translation_data, dict):
+                            translation_data = {'original': str(translation_data), 'translations': {}}
+                        # 添加到弹幕系统（线程安全投喂，控件创建在 Qt 线程内完成）
                         self.danmaku_manager.add_danmaku(translation_data)
                     except queue.Empty:
                         continue
@@ -311,8 +351,10 @@ class RealtimeSubtitleSystem:
             'audio_capture': self.audio_capturer.running,
             'transcription': self.whisper_transcriber.running,
             'translation': self.translator.running if self.translator else True,
-            # 弹幕窗口模式未启用（需主线程跑 Qt 事件循环），不作为异常上报
         }
+        # 弹幕 GUI 模式下监控窗口存活（此前未启用不纳入检查）
+        if self.config['system'].get('display_mode', 'danmaku') == 'danmaku':
+            statuses['danmaku_gui'] = self.danmaku_manager.is_running()
         
         for module, status in statuses.items():
             if not status:
@@ -385,18 +427,43 @@ class RealtimeSubtitleSystem:
             logger.error(f"性能报告生成失败: {e}")
     
     def _wait_for_shutdown(self):
-        """等待系统关闭"""
+        """等待系统关闭。GUI 模式下主线程在此进入 Qt 事件循环并阻塞。"""
+        if self._gui_mode:
+            # 主线程被 Qt 事件循环占用，回车退出改由专用线程监听 stdin；
+            # stdin 关闭/EOF（如后台重定向运行）同样触发优雅退出
+            print("按回车键或 Ctrl+C 停止系统...")
+            sys.stdout.flush()
+            threading.Thread(target=self._stdin_quit_watcher,
+                             name="stdin-watcher", daemon=True).start()
+            try:
+                self.danmaku_manager.run_event_loop(
+                    quit_check=lambda: self._signal_stop or self._stdin_stop
+                )
+            finally:
+                self.stop()
+                # CUDA/模型原生线程可能卡住解释器正常退出（实测会留下占内存的僵尸进程），
+                # 各服务已全部停止，直接强制退出
+                import os
+                os._exit(0)
+
         try:
-            # 这里可以添加更多的交互逻辑
             input("按回车键停止系统...\n")
         except KeyboardInterrupt:
             pass
         finally:
             self.stop()
-            # CUDA/模型原生线程可能卡住解释器正常退出（实测会留下占内存的僵尸进程），
-            # 各服务已全部停止，直接强制退出
             import os
             os._exit(0)
+
+    def _stdin_quit_watcher(self):
+        """GUI 模式下的回车退出监听（运行在独立线程，主线程在 Qt 事件循环里）。"""
+        try:
+            sys.stdin.readline()  # 阻塞直至回车或 EOF
+        except Exception:
+            pass
+        logger.info("收到回车退出指令")
+        self._stdin_stop = True
+        self.danmaku_manager.request_quit()
     
     def stop(self):
         """停止系统"""

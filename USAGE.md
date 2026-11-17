@@ -54,9 +54,12 @@ run.bat
 python main.py
 ```
 
-3. **系统启动后**
-   - 会自动打开透明的弹幕窗口
+3. **系统启动后**（默认 `display_mode: "danmaku"`）
+   - 会自动打开透明的置顶弹幕窗口，识别结果以"原文 | 译文"的形式从屏幕右侧飘过
    - 开始播放系统音频即可看到实时字幕
+   - 按**回车**或 **Ctrl+C** 停止系统（弹幕窗口随事件循环退出自动消失）
+   - 不想要弹幕浮层时，把 `config/config.yaml` 中 `system.display_mode` 改为 `"console"`，
+     字幕改为输出到控制台日志
 
 ## 配置说明
 
@@ -82,11 +85,16 @@ translation:
     - "ja"             # 日语
     - "ko"             # 韩语
 
+# 系统设置
+system:
+  display_mode: "danmaku"  # danmaku = 桌面弹幕浮层 GUI；console = 仅控制台日志
+
 # 弹幕显示设置
 danmaku:
   font_size: 16         # 字体大小
-  speed: 8000           # 弹幕移动速度（毫秒）
-  y_range: [800, 1000]  # 弹幕出现的垂直范围
+  color: "white"        # 弹幕颜色
+  speed: 8000           # 弹幕横穿屏幕的时长（毫秒）
+  y_range: [800, 1000]  # 弹幕出现的垂直范围（超出屏幕会自动截断）
 ```
 
 ## 性能优化建议

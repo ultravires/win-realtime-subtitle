@@ -53,6 +53,7 @@ danmaku:
 
 # 系统配置
 system:
+  display_mode: "danmaku"  # danmaku = 桌面弹幕浮层 GUI（透明置顶窗口）；console = 仅控制台日志
   log_level: "INFO"
   max_workers: 4  # 最大工作线程数
   retry_attempts: 3  # 重试次数
