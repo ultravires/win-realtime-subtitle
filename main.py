@@ -5,6 +5,7 @@
 实时多语言字幕系统主程序 - 优化版本
 """
 
+import os
 import threading
 import queue
 import signal
@@ -18,10 +19,37 @@ from utils.helpers import load_config, setup_logging
 # 不在模块顶部导入，而是在 RealtimeSubtitleSystem.__init__ 中、日志系统就绪后
 # 带计时导入——否则启动最初十几秒到几十秒完全无输出，看起来像卡死。
 
+# 关闭流程兜底时限：任何退出请求（Ctrl+C / 回车 / stdin EOF）置位后，超过此时限
+# 仍未完成优雅关闭，看门狗直接强制退出，保证进程绝不永久卡死
+SHUTDOWN_FORCE_EXIT_SEC = 20.0
+
+
 class RealtimeSubtitleSystem:
     """实时字幕系统主类 - 优化版本"""
-    
+
     def __init__(self, config_path: str = "config/config.yaml"):
+        # ---- 退出状态标志：必须最先定义（信号处理器/看门狗任何时刻都可能访问）----
+        self.running = False
+        self._stopped = False
+        self._fully_stopped = False
+        self._gui_mode = False
+        self._signal_stop = False   # Ctrl+C / SIGTERM 置位
+        self._stdin_stop = False    # 回车 / stdin EOF 置位
+        self.threads = []
+        self.display_manager = None
+        self.performance_stats = {'start_time': None}
+
+        # 尽早注册信号处理器：启动阶段（模型加载等长耗时操作）按下 Ctrl+C 也能被记录。
+        # 信号处理器只置标志，绝不在处理器内执行 stop()/sys.exit()——Windows 控制台实测，
+        # 主线程阻塞在 input()/C 扩展里时，处理器内的 SystemExit 会被吞掉或打断半途的清理，
+        # 这是此前 Ctrl+C 卡死的根源之一；统一改为"置标志 → 主线程/事件循环感知 → 主线程清理"
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        # 退出看门狗：独立线程兜底，保证置位后 SHUTDOWN_FORCE_EXIT_SEC 内进程必退。
+        # 在 __init__ 启动（而非 start()），覆盖模型加载等启动阶段的 Ctrl+C
+        self._start_exit_watchdog()
+
         # 加载配置
         self.config = load_config(config_path)
 
@@ -38,6 +66,7 @@ class RealtimeSubtitleSystem:
         from translation.translator import TencentTranslator
         from translation.simple_translator import SimpleTranslator
         from danmaku.danmaku_window import DanmakuManager
+        from danmaku.subtitle_window import SubtitleManager
         logger.info(f"依赖导入完成，耗时 {time.time() - t0:.1f}s")
 
         # 初始化各模块（按配置选择识别后端）
@@ -49,38 +78,23 @@ class RealtimeSubtitleSystem:
         else:
             self.whisper_transcriber = WhisperTranscriber(self.config)
             logger.info("识别后端: faster-whisper 窗口式")
-        
+
         # 尝试初始化腾讯翻译器，失败则使用简化版
         self.translator = self._init_translator()
-        
-        self.danmaku_manager = DanmakuManager(self.config)
-        
+
+        # 字幕显示管理器：按 display_mode 创建（subtitle 字幕浮窗 / danmaku 弹幕 / console 控制台）
+        display_mode = self.config['system'].get('display_mode', 'subtitle')
+        if display_mode == 'danmaku':
+            self.display_manager = DanmakuManager(self.config)
+        elif display_mode == 'subtitle':
+            self.display_manager = SubtitleManager(self.config)
+        else:
+            self.display_manager = None  # console 模式不需要 GUI 管理器
+
         # 数据队列
         self.text_queue = queue.Queue(maxsize=10)
         self.translation_queue = queue.Queue(maxsize=20)
-        
-        # 系统状态
-        self.running = False
-        self._stopped = False
-        self._fully_stopped = False
-        self.threads = []
 
-        # GUI 模式状态：display_mode=danmaku 时主线程被 Qt 事件循环占用，
-        # Ctrl+C / 回车退出均转为置标志 + 线程安全地请求退出事件循环
-        self._gui_mode = False
-        self._signal_stop = False
-        self._stdin_stop = False
-        
-        # 性能监控
-        self.performance_stats = {
-            'start_time': None,
-            'last_stats_time': None
-        }
-        
-        # 注册信号处理器
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        
     def _init_translator(self):
         """初始化翻译器，带错误处理"""
         # 翻译器类在 __init__ 的计时导入块中已随模块加载（sys.modules 已缓存），
@@ -107,37 +121,36 @@ class RealtimeSubtitleSystem:
                 logger.error(f"简化翻译器也初始化失败: {e2}")
                 logger.warning("系统将在无翻译模式下运行（仅显示原文）")
                 return None
-    
-    def _signal_handler(self, signum, frame):
-        """信号处理器。
 
-        GUI 模式下主线程阻塞在 Qt 事件循环内部（异常无法从 C 层传递出来），
-        此处只置退出标志并线程安全地请求退出事件循环；事件循环退出后，
-        _wait_for_shutdown 在主线程完成完整清理。
+    def _signal_handler(self, signum, frame):
+        """信号处理器：只置退出标志，不在处理器内执行清理或退出。
+
+        - GUI 模式：主线程阻塞在 Qt 事件循环内（异常无法从 C 层传递出来），
+          置标志 + 线程安全地请求退出事件循环；事件循环退出后 _wait_for_shutdown
+          在主线程完成完整清理
+        - 控制台模式：主线程轮询退出标志，200ms 内感知并完成清理
+        - 看门狗线程兜底：标志置位后超时未完成清理则强制退出进程
         """
+        self._signal_stop = True
         logger.info(f"接收到信号 {signum}，正在关闭系统...")
-        if self._gui_mode:
-            self._signal_stop = True
-            self.danmaku_manager.request_quit()
-        else:
-            self.stop()
-            sys.exit(0)
-    
+        if self._gui_mode and self.display_manager is not None:
+            self.display_manager.request_quit()
+
     def start(self):
         """启动系统"""
         try:
             logger.info("正在启动实时字幕系统...")
             self.performance_stats['start_time'] = time.time()
-            
+
             # 启动音频捕获
             self.audio_capturer.start_capture()
-            
+
             # 启动语音转写
             self.whisper_transcriber.start_transcription(
-                self.audio_capturer.audio_queue, 
+                self.audio_capturer.audio_queue,
                 self.text_queue
             )
-            
+
             # 运行标志必须在启动任何 worker 线程之前置位：
             # 所有消费线程都是 while self.running 循环，不置位会导致线程
             # 启动即退出、text_queue 无人消费直至打满、转写结果被丢弃
@@ -153,31 +166,32 @@ class RealtimeSubtitleSystem:
                 # 无翻译模式：直接将文本转发到翻译队列
                 self._start_passthrough_mode()
 
-            # 字幕显示：按配置选择桌面弹幕 GUI 或控制台日志。
+            # 字幕显示：按配置选择字幕浮窗 / 弹幕 / 控制台日志。
             # 无论哪种模式 translation_queue 都必须有消费者，否则打满后
             # 背压会层层传导回 text_queue，字幕被丢弃。
-            if self.config['system'].get('display_mode', 'danmaku') == 'danmaku':
-                # 必须在启动消费线程前置位：信号处理器按此选择关闭路径
-                self._gui_mode = True
-                self._start_danmaku_gui()
-            else:
+            display_mode = self.config['system'].get('display_mode', 'subtitle')
+            if display_mode == 'console' or self.display_manager is None:
                 self._gui_mode = False
                 self._start_display_worker()
+            else:
+                # 必须在启动消费线程前置位：信号处理器按此选择关闭路径
+                self._gui_mode = True
+                self._start_display_gui()
 
             # 启动监控线程
             self._start_monitor_thread()
 
-            # 启动退出看门狗
-            self._start_exit_watchdog()
-
             # 等待系统运行
             self._wait_for_shutdown()
-            
+
         except Exception as e:
             logger.error(f"系统启动失败: {e}")
+            # 置位退出标志让看门狗兜底：启动失败路径上 CUDA 原生线程
+            # 可能卡住解释器正常退出，必须保证进程真正结束
+            self._signal_stop = True
             self.stop()
             raise
-    
+
     def _start_passthrough_mode(self):
         """启动直通模式（无翻译）"""
         def passthrough_worker():
@@ -190,7 +204,7 @@ class RealtimeSubtitleSystem:
                             text = text_item['text']
                         else:
                             text = text_item
-                            
+
                         # 构造只有原文的结果
                         result = {
                             'original': text,
@@ -211,29 +225,29 @@ class RealtimeSubtitleSystem:
         self.threads.append(thread)
         logger.info("启动直通模式（无翻译）")
 
-    def _start_danmaku_gui(self):
-        """启动弹幕 GUI 显示。
+    def _start_display_gui(self):
+        """启动字幕 GUI 显示（字幕浮窗或弹幕，按 display_manager 实际类型）。
 
-        DanmakuManager.start() 在主线程创建 QApplication 与弹幕窗口（非阻塞，
-        不运行事件循环）；事件循环由 _wait_for_shutdown → run_event_loop()
-        启动并占用主线程，退出条件（Ctrl+C / 回车）由循环内轮询定时器检测。
-        本方法额外启动弹幕消费线程，把 translation_queue 的结果投喂给弹幕窗口。
-        GUI 启动失败（如无显示环境）时自动回退到控制台显示模式。
+        Manager.start() 在主线程创建 QApplication 与窗口（非阻塞，不运行事件
+        循环）；事件循环由 _wait_for_shutdown → run_event_loop() 启动并占用主
+        线程，退出条件（Ctrl+C / 回车）由循环内轮询定时器检测。本方法额外启动
+        消费线程，把 translation_queue 的结果投喂给窗口。GUI 启动失败（如无
+        显示环境）时自动回退到控制台显示模式。
         """
         try:
-            self.danmaku_manager.start()
+            self.display_manager.start()
         except Exception as e:
-            logger.warning(f"弹幕 GUI 启动失败: {e}，回退到控制台显示模式")
+            logger.warning(f"字幕 GUI 启动失败: {e}，回退到控制台显示模式")
             self._gui_mode = False
             self._start_display_worker()
             return
-        self._start_danmaku_thread()
-        logger.info("字幕显示: 弹幕窗口模式（GUI）")
+        self._start_display_thread()
+        logger.info(f"字幕显示: {self.display_manager.mode_label}（GUI）")
 
     def _start_display_worker(self):
         """字幕显示线程：消费 translation_queue，在控制台输出最终字幕。
 
-        作为 display_mode: console 的显示方式，也是弹幕 GUI 启动失败时的回退。"""
+        作为 display_mode: console 的显示方式，也是字幕 GUI 启动失败时的回退。"""
         def display_worker():
             while self.running:
                 try:
@@ -263,88 +277,80 @@ class RealtimeSubtitleSystem:
         thread.start()
         self.threads.append(thread)
         logger.info("字幕显示线程已启动（控制台模式）")
-    
-    def _start_danmaku_thread(self):
-        """启动弹幕消费线程：translation_queue → 弹幕窗口（GUI 显示）"""
-        def danmaku_worker():
+
+    def _start_display_thread(self):
+        """启动显示消费线程：translation_queue → 字幕窗口（GUI 显示）"""
+        def display_feeder():
             try:
                 while self.running:
                     try:
-                        # 从翻译队列获取数据
-                        translation_data = self.translation_queue.get(timeout=1.0)
-                        # 非 dict 数据（异常路径）包装成弹幕格式，避免静默丢失
-                        if not isinstance(translation_data, dict):
-                            translation_data = {'original': str(translation_data), 'translations': {}}
-                        # 添加到弹幕系统（线程安全投喂，控件创建在 Qt 线程内完成）
-                        self.danmaku_manager.add_danmaku(translation_data)
+                        data = self.translation_queue.get(timeout=1.0)
+                        # 非 dict 数据（异常路径）包装成统一格式，避免静默丢失
+                        if not isinstance(data, dict):
+                            data = {'original': str(data), 'translations': {}}
+                        # 线程安全投喂，控件更新由 Qt 线程的定时器回调完成
+                        self.display_manager.add_result(data)
                     except queue.Empty:
                         continue
                     except Exception as e:
-                        logger.error(f"弹幕处理错误: {e}")
+                        logger.error(f"显示处理错误: {e}")
                         continue
-                        
+
             except Exception as e:
-                logger.error(f"弹幕线程异常: {e}")
-        
-        thread = threading.Thread(target=danmaku_worker, daemon=True)
+                logger.error(f"显示线程异常: {e}")
+
+        thread = threading.Thread(target=display_feeder, daemon=True)
         thread.start()
         self.threads.append(thread)
-    
-    def _start_exit_watchdog(self):
-        """退出看门狗：确保进程真正退出。
 
-        Ctrl+C 时信号处理器抛出的 SystemExit 可能被阻塞在 input() 中的主线程吞掉
-        （Windows 控制台实测如此），导致 stop() 完成后进程仍然滞留。
-        本看门狗运行在独立线程，不依赖异常传播。"""
+    def _start_exit_watchdog(self):
+        """退出看门狗：保证进程真正退出（__init__ 中启动，覆盖启动阶段）。
+
+        任何退出请求（_signal_stop / _stdin_stop）置位后启动倒计时：
+        - 优雅关闭完成（_fully_stopped）→ 立即 os._exit(0)
+        - 超过 SHUTDOWN_FORCE_EXIT_SEC 仍未完成 → 强制退出，绝不永久卡死
+        本线程不依赖异常传播，也不依赖主线程是否可中断——此前 Ctrl+C 落在
+        input() / Qt 事件循环 / C 扩展里时主线程无法自救，由看门狗解决。
+        """
         def watchdog():
             deadline = None
-            import os
-            import time
             while True:
-                if self._stopped:
+                if self._signal_stop or self._stdin_stop:
                     if self._fully_stopped:
                         os._exit(0)
                     if deadline is None:
-                        deadline = time.time() + 15
+                        deadline = time.time() + SHUTDOWN_FORCE_EXIT_SEC
                     elif time.time() > deadline:
-                        # stop() 卡死超过15秒，强制退出
+                        logger.error(f"关闭流程超过 {SHUTDOWN_FORCE_EXIT_SEC:.0f}s 未完成，强制退出进程")
                         os._exit(0)
                 time.sleep(0.2)
 
-        thread = threading.Thread(target=watchdog, daemon=True)
+        thread = threading.Thread(target=watchdog, name="exit-watchdog", daemon=True)
         thread.start()
-        self.threads.append(thread)
-        logger.info("退出看门狗已启动")
 
     def _start_monitor_thread(self):
-        """启动监控线程 - 增强版本"""
+        """启动监控线程：检查模块状态与队列压力。
+
+        性能详情不在运行期间周期打印（用户要求），只在 stop() 结束前汇总一次。"""
         def monitor_worker():
             while self.running:
                 try:
                     # 监控各模块状态
                     self._check_module_status()
-                    
-                    # 记录系统统计信息
+
+                    # 队列压力监控：仅在负载较高时告警（debug 级别统计不刷屏）
                     self._log_system_stats()
-                    
-                    # 每30秒输出一次详细性能报告
-                    import time
-                    current_time = time.time()
-                    if (self.performance_stats['last_stats_time'] is None or 
-                        current_time - self.performance_stats['last_stats_time'] >= 30):
-                        self._log_detailed_performance_report()
-                        self.performance_stats['last_stats_time'] = current_time
-                    
+
                     # 睡眠一段时间
-                    time.sleep(5)  # 从10秒改为5秒，更及时的监控
-                    
+                    time.sleep(5)
+
                 except Exception as e:
                     logger.error(f"监控线程错误: {e}")
-        
+
         thread = threading.Thread(target=monitor_worker, daemon=True)
         thread.start()
         self.threads.append(thread)
-    
+
     def _check_module_status(self):
         """检查各模块运行状态"""
         statuses = {
@@ -352,50 +358,45 @@ class RealtimeSubtitleSystem:
             'transcription': self.whisper_transcriber.running,
             'translation': self.translator.running if self.translator else True,
         }
-        # 弹幕 GUI 模式下监控窗口存活（此前未启用不纳入检查）
-        if self.config['system'].get('display_mode', 'danmaku') == 'danmaku':
-            statuses['danmaku_gui'] = self.danmaku_manager.is_running()
-        
+        # GUI 模式下监控字幕窗口存活
+        if self._gui_mode and self.display_manager is not None:
+            statuses['display_gui'] = self.display_manager.is_running()
+
         for module, status in statuses.items():
             if not status:
                 logger.warning(f"模块 {module} 未正常运行")
-    
+
     def _log_system_stats(self):
-        """记录系统统计信息"""
+        """记录系统统计信息（只在队列压力较高时告警，避免周期性刷屏）"""
         try:
-            # 获取音频捕获器的详细统计
             audio_stats = self.audio_capturer.get_performance_stats()
-            
+
             stats = {
                 'audio_queue_size': self.audio_capturer.get_queue_size(),
                 'text_queue_size': self.text_queue.qsize(),
                 'translation_queue_size': self.translation_queue.qsize(),
-                'active_danmakus': self.danmaku_manager.window.get_active_count() if self.danmaku_manager.window else 0,
                 'audio_capture_stats': audio_stats
             }
-            
+
             # 只在队列压力较大时记录警告
             if (stats['audio_queue_size'] > self.config['audio']['buffer_size'] * 0.7 or
                 stats['text_queue_size'] > 8 or
                 stats['translation_queue_size'] > 15):
                 logger.warning(f"系统负载较高: {stats}")
-            else:
-                logger.debug(f"系统统计: 音频队列{stats['audio_queue_size']}/{self.config['audio']['buffer_size']}, "
-                           f"文本队列{stats['text_queue_size']}/10, "
-                           f"翻译队列{stats['translation_queue_size']}/20")
-            
+
         except Exception as e:
             logger.error(f"统计信息记录失败: {e}")
-    
+
     def _log_detailed_performance_report(self):
-        """记录详细性能报告"""
+        """输出性能汇总报告（只在系统结束前调用一次，不做周期打印）"""
         try:
-            import time
             current_time = time.time()
+            if self.performance_stats['start_time'] is None:
+                return
             runtime = current_time - self.performance_stats['start_time']
-            
+
             audio_stats = self.audio_capturer.get_performance_stats()
-            
+
             report = {
                 '运行时间': f"{runtime:.1f}秒",
                 '音频捕获统计': {
@@ -411,9 +412,9 @@ class RealtimeSubtitleSystem:
                     '翻译队列': f"{self.translation_queue.qsize()}/20"
                 }
             }
-            
+
             logger.info("=" * 50)
-            logger.info("系统性能详细报告:")
+            logger.info("系统性能汇总报告（结束时）:")
             for key, value in report.items():
                 if isinstance(value, dict):
                     logger.info(f"  {key}:")
@@ -422,10 +423,10 @@ class RealtimeSubtitleSystem:
                 else:
                     logger.info(f"  {key}: {value}")
             logger.info("=" * 50)
-            
+
         except Exception as e:
             logger.error(f"性能报告生成失败: {e}")
-    
+
     def _wait_for_shutdown(self):
         """等待系统关闭。GUI 模式下主线程在此进入 Qt 事件循环并阻塞。"""
         if self._gui_mode:
@@ -433,67 +434,78 @@ class RealtimeSubtitleSystem:
             # stdin 关闭/EOF（如后台重定向运行）同样触发优雅退出
             print("按回车键或 Ctrl+C 停止系统...")
             sys.stdout.flush()
-            threading.Thread(target=self._stdin_quit_watcher,
-                             name="stdin-watcher", daemon=True).start()
+            self._start_stdin_watcher()
             try:
-                self.danmaku_manager.run_event_loop(
+                self.display_manager.run_event_loop(
                     quit_check=lambda: self._signal_stop or self._stdin_stop
                 )
             finally:
                 self.stop()
                 # CUDA/模型原生线程可能卡住解释器正常退出（实测会留下占内存的僵尸进程），
-                # 各服务已全部停止，直接强制退出
-                import os
+                # 各服务已全部停止，直接强制退出（看门狗同时兜底）
                 os._exit(0)
 
+        # 控制台模式：轮询退出标志（信号处理器只置标志，不在处理器内嵌套清理）。
+        # 不再用阻塞的 input()——主线程周期性回到 Python 字节码层，Ctrl+C 处理
+        # 器必然可执行，标志 200ms 内被感知，彻底避免"SystemExit 被吞→卡死"
+        print("按回车键或 Ctrl+C 停止系统...")
+        sys.stdout.flush()
+        self._start_stdin_watcher()
         try:
-            input("按回车键停止系统...\n")
-        except KeyboardInterrupt:
-            pass
+            while not (self._signal_stop or self._stdin_stop):
+                time.sleep(0.2)
         finally:
             self.stop()
-            import os
             os._exit(0)
 
+    def _start_stdin_watcher(self):
+        """启动回车退出监听线程（主线程被 Qt 事件循环或轮询占用时由它感知回车/EOF）"""
+        threading.Thread(target=self._stdin_quit_watcher,
+                         name="stdin-watcher", daemon=True).start()
+
     def _stdin_quit_watcher(self):
-        """GUI 模式下的回车退出监听（运行在独立线程，主线程在 Qt 事件循环里）。"""
+        """回车退出监听：回车或 stdin EOF 均触发优雅退出。"""
         try:
             sys.stdin.readline()  # 阻塞直至回车或 EOF
         except Exception:
             pass
-        logger.info("收到回车退出指令")
+        logger.info("收到回车退出指令（或输入流关闭）")
         self._stdin_stop = True
-        self.danmaku_manager.request_quit()
-    
+        if self._gui_mode and self.display_manager is not None:
+            self.display_manager.request_quit()
+
     def stop(self):
-        """停止系统"""
+        """停止系统（应在主线程调用；信号处理器只置标志，不直接调用本方法）"""
         if self._stopped:
             return
         self._stopped = True
         logger.info("正在关闭实时字幕系统...")
-        
-        self.running = False
-        
-        # 停止各模块
-        self.audio_capturer.stop_capture()
-        self.whisper_transcriber.stop_transcription()
-        if self.translator:
-            self.translator.stop_translation()
-        self.danmaku_manager.stop()
-        
-        # 输出最终性能统计
-        self._log_detailed_performance_report()
-        
-        # 等待线程结束
-        for thread in self.threads:
-            thread.join(timeout=2)
 
-        logger.info("实时字幕系统已关闭")
-        self._fully_stopped = True
-    
+        self.running = False
+
+        try:
+            # 停止各模块（各自内部有超时/异常保护）
+            self.audio_capturer.stop_capture()
+            self.whisper_transcriber.stop_transcription()
+            if self.translator:
+                self.translator.stop_translation()
+            if self.display_manager is not None:
+                self.display_manager.stop()
+
+            # 输出最终性能汇总（只在结束时打印一次）
+            self._log_detailed_performance_report()
+        except Exception as e:
+            logger.error(f"停止过程中出现异常: {e}")
+        finally:
+            # 等待线程结束（各自有超时，不会无限等待）
+            for thread in self.threads:
+                thread.join(timeout=2)
+
+            logger.info("实时字幕系统已关闭")
+            self._fully_stopped = True
+
     def _get_current_timestamp(self) -> float:
         """获取当前时间戳"""
-        import time
         return time.time()
 
 def main():
@@ -501,10 +513,10 @@ def main():
     try:
         # 创建系统实例
         system = RealtimeSubtitleSystem()
-        
+
         # 启动系统
         system.start()
-        
+
     except KeyboardInterrupt:
         logger.info("用户中断程序")
     except Exception as e:

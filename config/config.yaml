@@ -25,11 +25,13 @@ whisper:
 streaming:
   model_dir: "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
   decoding_method: "modified_beam_search"
-  rule1_min_trailing_silence: 1.0  # 句尾停顿1秒→出字幕
+  rule1_min_trailing_silence: 1.0  # 句尾停顿1秒→出字幕（兜底路径）
   rule2_min_trailing_silence: 2.5  # 长静音强制断句
   provider: "cpu"         # cpu 即可实时；cuda 可选
   num_threads: 2
   punctuation_model: "models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12"  # 空串则不加载
+  early_emit_punctuation: true  # 断句符号稳定提前出字幕：遇到 ，。？！； 等符号后，符号前的句子 stable 秒内未被修正即直接输出（需加载 punctuation_model）
+  early_emit_stable_sec: 1.0    # 符号前的句子保持稳定多少秒后提前输出
 
 # 翻译模型配置
 translation:
@@ -41,7 +43,7 @@ translation:
   target_languages:      # 目标翻译语言（源语言为 zh，zh→zh 无意义已移除，翻译耗时减半）
     - "en"  # 英语
 
-# 弹幕展示配置
+# 弹幕展示配置（display_mode: danmaku 时生效）
 danmaku:
   window_width: 1920
   window_height: 1080
@@ -51,9 +53,19 @@ danmaku:
   color: "white"
   background_alpha: 0.5  # 背景透明度
 
+# 字幕浮窗配置（display_mode: subtitle 时生效）
+subtitle:
+  width_ratio: 0.6          # 浮窗宽度占屏幕宽度的比例
+  y_offset: 100             # 浮窗底部距屏幕底部的距离(px)
+  original_font_size: 22    # 识别文本字号
+  translation_font_size: 18 # 翻译文本字号
+  original_color: "white"
+  translation_color: "#ffd966"
+  background_alpha: 0.55    # 浮窗背景透明度(0-1)
+
 # 系统配置
 system:
-  display_mode: "danmaku"  # danmaku = 桌面弹幕浮层 GUI（透明置顶窗口）；console = 仅控制台日志
+  display_mode: "subtitle"  # subtitle = 字幕浮窗（上：识别原文，下：翻译，可拖动）；danmaku = 桌面弹幕；console = 仅控制台日志
   log_level: "INFO"
   max_workers: 4  # 最大工作线程数
   retry_attempts: 3  # 重试次数

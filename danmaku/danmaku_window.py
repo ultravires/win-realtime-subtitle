@@ -241,13 +241,14 @@ class DanmakuManager:
     - run_event_loop() 在主线程启动事件循环并阻塞，直至 quit
     - 跨线程只通过线程安全通道交互：
       · 数据面：danmaku_queue（queue.Queue），控件创建由主线程定时器完成
-      · 控制面：request_quit() → app.quit()（QCoreApplication 保证线程安全）
+      · 控制面：request_quit() 只置标志，app.quit() 仅由事件循环内部触发
     主线程被事件循环占用期间，回车退出由 main.py 的 stdin 监听线程经
     request_quit() 触发；Ctrl+C 由事件循环内的轮询定时器检测退出标志触发
     （该定时器同时保证主线程周期性回到 Python 字节码层，使信号可被处理）。
     """
 
     QUIT_CHECK_INTERVAL_MS = 200
+    mode_label = "弹幕窗口"
 
     def __init__(self, config: dict):
         self.config = config
@@ -255,6 +256,7 @@ class DanmakuManager:
         self.window: Optional[DanmakuWindow] = None
         self.running = False
         self._quit_timer: Optional[QTimer] = None
+        self._quit_requested = False  # 跨线程退出请求标志（request_quit 置位）
 
     def start(self):
         """在主线程创建 QApplication 与弹幕窗口并显示（非阻塞，不运行事件循环）。
@@ -272,6 +274,7 @@ class DanmakuManager:
             self.app.aboutToQuit.connect(self.window.clear_all_danmakus)
             self.window.show()
             self.running = True
+            self._quit_requested = False
             logger.info("弹幕窗口已创建（GUI 模式）")
         except Exception as e:
             self.running = False
@@ -281,15 +284,30 @@ class DanmakuManager:
     def run_event_loop(self, quit_check=None):
         """运行 Qt 事件循环，阻塞直至退出。必须在主线程调用。
 
-        quit_check: 可选无参函数，每 200ms 在主线程内轮询一次，返回 True
-        则退出事件循环。返回 app.exec() 的退出码。
+        退出判定（每 200ms 由主线程定时器轮询）：quit_check() 为 True，或
+        request_quit() 曾被调用。app.quit() 只能由事件循环内部（本定时器回调）
+        触发——实测 PyQt6 在 exec() 启动前从其他线程调用 app.quit() 会死锁
+        整个进程（持有 GIL 的 C++ 调用永不返回），跨线程退出必须走标志位。
+        返回 app.exec() 的退出码。
         """
         if self.app is None or not self.running:
             raise RuntimeError("弹幕系统未启动，无法运行事件循环")
 
+        def effective_quit() -> bool:
+            if self._quit_requested:
+                return True
+            return bool(quit_check()) if quit_check is not None else False
+
+        # 退出条件在事件循环启动前已满足：直接返回，不进入 exec()
+        # （exec 启动前没有任何机制能退出它，进入即死锁风险）
+        if effective_quit():
+            logger.info("退出条件在事件循环启动前已满足，跳过弹幕事件循环")
+            self.running = False
+            return 0
+
         def _check():
             try:
-                if quit_check is not None and quit_check():
+                if effective_quit():
                     logger.info("检测到退出条件，退出弹幕事件循环")
                     self.app.quit()
             except Exception as e:
@@ -308,9 +326,12 @@ class DanmakuManager:
         return rc
 
     def request_quit(self):
-        """请求退出事件循环（线程安全，可从任意线程调用）"""
-        if self.app is not None:
-            self.app.quit()
+        """请求退出事件循环（线程安全：仅置标志，可从任意线程调用）。
+
+        绝不直接调用 app.quit()——事件循环未启动时调用它会死锁（见
+        run_event_loop 文档）；标志由启动前检查或循环内轮询定时器消费。
+        """
+        self._quit_requested = True
 
     def stop(self):
         """停止弹幕系统。须在主线程调用（Qt 控件只能由其所在线程操作）。"""
@@ -337,3 +358,7 @@ class DanmakuManager:
         """添加弹幕（线程安全）"""
         if self.window and self.running:
             self.window.put_danmaku(danmaku_data)
+
+    def add_result(self, data: dict):
+        """统一投喂接口（与 SubtitleManager.add_result 对齐，main.py 按 display_mode 调用）"""
+        self.add_danmaku(data)

@@ -22,6 +22,8 @@ class StreamingTranscriber:
 
     - 每 0.5s 音频块增量送入在线解码器，说话过程中模型持续产出部分结果
     - 内置端点检测：句尾停顿 rule1 秒 / 长静音 rule2 秒 → 产出最终文本并复位流
+    - 断句符号稳定提前出字幕：说话中遇到 ，。？！； 等符号后，符号前的句子
+      stable 秒内未被修正即提前输出（标点模型作用于流式部分结果）
     - CPU 即可实时（RTF << 1），不占显存；可通过 provider 换 CUDA
     - 可选挂接标点恢复模型，字幕更自然
     """
@@ -46,6 +48,17 @@ class StreamingTranscriber:
 
         # 与 whisper 配置对齐的语言设置：bilingual zh-en 模型按输入自动区分
         self.language_hint = wcfg.get('language', 'zh')
+
+        # 断句符号稳定提前出字幕：说话不停顿时，只要符号前的句子 stable 秒内
+        # 未被修正就先输出（不必等整句说完的静音端点）。依赖标点恢复模型
+        self.early_emit_enabled = scfg.get('early_emit_punctuation', True)
+        self.early_emit_stable_sec = float(scfg.get('early_emit_stable_sec', 1.0))
+        self.break_puncts = '，。？！；,.?!;'
+        self._committed_len = 0        # 已提前输出的原文前缀长度（字符数）
+        self._pending_punct_key = ""   # 上一次标点恢复对应的原文
+        self._pending_punctuated = ""  # 其恢复结果（含标点）
+        self._candidate = ""           # 当前等待稳定的候选句（含标点）
+        self._candidate_since = 0.0    # 候选首次出现的时间
 
         self.recognizer = None
         self.running = False
@@ -135,6 +148,7 @@ class StreamingTranscriber:
         self._stream = self.recognizer.create_stream()
         self._stream_started = False
         self._last_text = ""
+        self._reset_early_emit_state()
         self.running = True
         self.transcribe_thread = threading.Thread(
             target=self._transcribe_loop,
@@ -143,7 +157,8 @@ class StreamingTranscriber:
         )
         self.transcribe_thread.start()
         logger.info(f"流式转写服务已启动 (decoding={self.decoding_method}, "
-                    f"endpoint rule1={self.rule1_min_trailing_silence}s)")
+                    f"endpoint rule1={self.rule1_min_trailing_silence}s, "
+                    f"断句提前出字幕={'开' if self.early_emit_enabled and self.punct is not None else '关'})")
 
     def stop_transcription(self):
         """停止转写服务"""
@@ -199,9 +214,17 @@ class StreamingTranscriber:
         if partial and self._stream_started:
             logger.debug(f"流式部分结果 ({decode_ms:.0f}ms): {partial}")
 
-        # 端点触发 → 产出该句并复位流
+        # 断句符号稳定 → 提前出字幕（说话不停顿也按标点切句，不等整句说完）
+        if partial and self._stream_started and self.early_emit_enabled:
+            try:
+                self._maybe_early_emit(partial, timestamp, text_queue)
+            except Exception as e:
+                logger.warning(f"提前出字幕检测失败: {e}")
+
+        # 端点触发 → 产出该句剩余部分并复位流（已提前输出的前缀不再重复）
         if self.recognizer.is_endpoint(self._stream):
-            self._emit(partial.strip(), timestamp, text_queue)
+            tail = partial[self._committed_len:] if self._committed_len else partial
+            self._emit(tail.strip(), timestamp, text_queue)
             self._reset_stream()
 
     def _current_result(self) -> str:
@@ -213,17 +236,101 @@ class StreamingTranscriber:
 
     def _reset_stream(self):
         """复位识别流：reset 保留解码器状态清理，等价于开启新语句"""
+        self._stream_started = False
+        self._reset_early_emit_state()
+        if self.recognizer is None:
+            return  # 模型未加载（如单元测试）也要保证状态被复位
         try:
             self.recognizer.reset(self._stream)
         except AttributeError:
             self._stream = self.recognizer.create_stream()
-        self._stream_started = False
 
-    def _emit(self, text: str, timestamp: float, text_queue: queue.Queue):
+    def _reset_early_emit_state(self):
+        """复位提前出字幕状态（新语句从零开始累计）"""
+        self._committed_len = 0
+        self._candidate = ""
+        self._pending_punct_key = ""
+        self._pending_punctuated = ""
+
+    def _maybe_early_emit(self, partial: str, timestamp: float, text_queue: queue.Queue):
+        """断句符号稳定检测 → 提前出字幕。
+
+        流式识别过程中，标点模型周期性作用于尚未输出的原文片段；当某个以断句
+        符号（，。？！；等）结尾的句子在 early_emit_stable_sec 内未被修正，即
+        认为相对稳定，直接输出，不再等整句说完的静音端点。已输出部分记录在
+        _committed_len，端点触发时只输出剩余部分，避免重复字幕。
+        """
+        if self.punct is None or not partial:
+            return
+        pending_raw = partial[self._committed_len:]
+        if not pending_raw:
+            return
+
+        # 原文有变化才重跑标点恢复（0.5s 块节奏下每块最多一次，控制 CPU 开销）
+        if pending_raw != self._pending_punct_key:
+            try:
+                self._pending_punctuated = self.punct.add_punctuation(pending_raw)
+            except Exception as e:
+                logger.warning(f"标点恢复失败（本轮跳过提前出字幕）: {e}")
+            self._pending_punct_key = pending_raw
+
+        punctuated = self._pending_punctuated
+        last_idx = -1
+        for i, ch in enumerate(punctuated):
+            if ch in self.break_puncts:
+                last_idx = i
+        if last_idx < 0:
+            self._candidate = ""  # 修正后断句符号消失，候选作废
+            return
+        candidate = punctuated[:last_idx + 1]
+
+        if candidate != self._candidate:
+            # 新候选（或候选被修正）：重新计时
+            self._candidate = candidate
+            self._candidate_since = time.time()
+            return
+
+        if time.time() - self._candidate_since < self.early_emit_stable_sec:
+            return  # 稳定时长不够，继续等（期间若被修正会在上面重新计时）
+
+        # 校验候选与原文逐字一致（忽略空白/大小写/标点差异），防止标点模型
+        # 改动文字或大小写导致与原始识别文本错位
+        cand_compact = self._compact_text(candidate)
+        if not cand_compact:
+            return
+        consumed = 0   # 候选对应的原文片段长度（用于推进已提交偏移）
+        pos = 0
+        for ch in pending_raw:
+            if pos >= len(cand_compact):
+                break
+            if not ch.isalnum():
+                consumed += 1  # 跳过原文中的空白/标点
+                continue
+            if ch.lower() != cand_compact[pos]:
+                return  # 文字被修正：等下一轮标点恢复后重新验证
+            pos += 1
+            consumed += 1
+        if pos < len(cand_compact):
+            return
+
+        self._emit(candidate, timestamp, text_queue, punctuated_already=True)
+        self._committed_len += consumed
+        self._candidate = ""
+        self._pending_punct_key = ""
+        self._pending_punctuated = ""
+        logger.debug(f"断句符号已稳定，提前输出: {candidate}")
+
+    @staticmethod
+    def _compact_text(text: str) -> str:
+        """可比对文本：仅保留字母/数字/汉字（小写化，忽略空白与标点）"""
+        return ''.join(ch for ch in text if ch.isalnum()).lower()
+
+    def _emit(self, text: str, timestamp: float, text_queue: queue.Queue,
+              punctuated_already: bool = False):
         if not text:
             return
         clean = sanitize_text(text)
-        if self.punct is not None:
+        if self.punct is not None and not punctuated_already:
             try:
                 clean = self.punct.add_punctuation(clean)
             except Exception as e:
