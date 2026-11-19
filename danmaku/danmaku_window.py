@@ -71,49 +71,73 @@ class DanmakuWindow(QWidget):
         self.timer.start(100)  # 100ms刷新一次
 
     def add_danmaku(self, danmaku_data: dict):
-        """添加新的弹幕（必须在 Qt 线程内调用，经 danmaku_queue 由定时器驱动）"""
+        """添加新的弹幕（必须在 Qt 线程内调用，经 danmaku_queue 由定时器驱动）。
+
+        支持三种事件：seg_original（原文小句，立即飘出）、seg_translation
+        （该小句译文，逐语言一条）、合并格式（原文+译文一条，整句路径）。
+        """
         try:
-            # 格式化弹幕文本
-            text = self.format_danmaku_text(danmaku_data)
-            if not text:
-                return
-
-            # 超过同屏上限时丢弃最早的弹幕
-            while len(self.active_danmakus) >= MAX_ACTIVE_DANMAKUS:
-                oldest = self.active_danmakus.pop(0)
-                try:
-                    if oldest['animation'] is not None:
-                        oldest['animation'].stop()
-                    oldest['label'].deleteLater()
-                except Exception:
-                    pass
-
-            # 创建弹幕标签
-            font_size = int(self.config['danmaku'].get('font_size', 16))
-            color = self.config['danmaku'].get('color', 'white')
-            label = DanmakuLabel(text, font_size, color, self)
-            label.setMaximumWidth(self.width())  # 超宽句子在屏幕内换行
-            label.adjustSize()
-
-            # 设置初始位置（右侧边缘外，Y 坐标按车道轮换）
-            y = self._pick_y()
-            label.move(self.width(), y)
-            label.show()
-
-            # 创建移动动画
-            animation = self.create_danmaku_animation(label, y)
-
-            # 保存活跃弹幕引用
-            self.active_danmakus.append({
-                'label': label,
-                'animation': animation,
-                'data': danmaku_data
-            })
-
-            logger.debug(f"添加弹幕: {text[:50]}...")
-
+            for text in self.danmaku_texts(danmaku_data):
+                self._spawn_bullet(text, danmaku_data)
         except Exception as e:
             logger.error(f"添加弹幕失败: {e}")
+
+    def danmaku_texts(self, danmaku_data: dict) -> list:
+        """事件 → 弹幕文本列表（空列表表示无可显示内容）"""
+        etype = danmaku_data.get('type')
+        if etype == 'seg_original':
+            t = str(danmaku_data.get('text') or '').strip()
+            return [t] if t else []
+        if etype == 'seg_translation':
+            # 小句译文：原文已随 seg_original 飘过，这里只展示译文
+            original = str(danmaku_data.get('original') or '')
+            vals = []
+            for lang in self.config['translation'].get('target_languages', []):
+                v = (danmaku_data.get('translations') or {}).get(lang)
+                if v and str(v) != original and str(v) not in vals:
+                    vals.append(str(v))
+            for k, v in (danmaku_data.get('translations') or {}).items():
+                if v and str(v) != original and str(v) not in vals:
+                    vals.append(str(v))
+            return vals
+        text = self.format_danmaku_text(danmaku_data)
+        return [text] if text else []
+
+    def _spawn_bullet(self, text: str, danmaku_data: dict):
+        """创建单条弹幕标签并启动飘移动画"""
+        # 超过同屏上限时丢弃最早的弹幕
+        while len(self.active_danmakus) >= MAX_ACTIVE_DANMAKUS:
+            oldest = self.active_danmakus.pop(0)
+            try:
+                if oldest['animation'] is not None:
+                    oldest['animation'].stop()
+                oldest['label'].deleteLater()
+            except Exception:
+                pass
+
+        # 创建弹幕标签
+        font_size = int(self.config['danmaku'].get('font_size', 16))
+        color = self.config['danmaku'].get('color', 'white')
+        label = DanmakuLabel(text, font_size, color, self)
+        label.setMaximumWidth(self.width())  # 超宽句子在屏幕内换行
+        label.adjustSize()
+
+        # 设置初始位置（右侧边缘外，Y 坐标按车道轮换）
+        y = self._pick_y()
+        label.move(self.width(), y)
+        label.show()
+
+        # 创建移动动画
+        animation = self.create_danmaku_animation(label, y)
+
+        # 保存活跃弹幕引用
+        self.active_danmakus.append({
+            'label': label,
+            'animation': animation,
+            'data': danmaku_data
+        })
+
+        logger.debug(f"添加弹幕: {text[:50]}...")
 
     def _pick_y(self) -> int:
         """车道轮换选择 Y 坐标：相邻弹幕走不同高度，避免重叠。

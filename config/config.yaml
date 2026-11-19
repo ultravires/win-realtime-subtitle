@@ -39,8 +39,8 @@ streaming:
   provider: "cpu"         # cpu 即可实时；cuda 可选
   num_threads: 2
   punctuation_model: "models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12"  # 空串则不加载
-  early_emit_punctuation: true  # 断句符号稳定提前出字幕：遇到 ，。？！； 等符号后，符号前的句子 stable 秒内未被修正即直接输出（需加载 punctuation_model）
-  early_emit_stable_sec: 1.0    # 符号前的句子保持稳定多少秒后提前输出
+  early_emit_punctuation: true  # 断句符号稳定提前出字幕：按小句（第一个未提交的 ，。？！； 等符号前的内容）独立计时，stable 秒内未被修正即输出（需加载 punctuation_model）
+  early_emit_stable_sec: 1.0    # 小句保持稳定多少秒后提前输出；稳定即直推浮窗上屏，译文随后按小句追加
 
 # 翻译模型配置
 translation:

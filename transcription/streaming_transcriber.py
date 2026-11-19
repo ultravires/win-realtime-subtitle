@@ -22,8 +22,9 @@ class StreamingTranscriber:
 
     - 每 0.5s 音频块增量送入在线解码器，说话过程中模型持续产出部分结果
     - 内置端点检测：句尾停顿 rule1 秒 / 长静音 rule2 秒 → 产出最终文本并复位流
-    - 断句符号稳定提前出字幕：说话中遇到 ，。？！； 等符号后，符号前的句子
-      stable 秒内未被修正即提前输出（标点模型作用于流式部分结果）
+    - 断句符号稳定提前出字幕：按小句（第一个未提交的 ，。？！； 等符号前的
+      内容）独立计时，stable 秒内未被修正即提前输出，不必等整句说完
+    - 原文直通显示：分段稳定即推送显示端上屏，译文随后按小句追加
     - CPU 即可实时（RTF << 1），不占显存；可通过 provider 换 CUDA
     - 可选挂接标点恢复模型，字幕更自然
     """
@@ -54,6 +55,11 @@ class StreamingTranscriber:
         self.early_emit_enabled = scfg.get('early_emit_punctuation', True)
         self.early_emit_stable_sec = float(scfg.get('early_emit_stable_sec', 1.0))
         self.break_puncts = '，。？！；,.?!;'
+        self.final_puncts = '。？！.?!'  # 句末符号：显示端据此"换句"（清空追加缓冲区）
+
+        # 原文直通显示队列：分段一旦稳定立即把原文推给显示端（不等翻译），
+        # main.py 注入 translation_queue。推送失败时条目带 seg=False 兜底走合并通道
+        self._display_queue = None
         self._committed_len = 0        # 已提前输出的原文前缀长度（字符数）
         self._pending_punct_key = ""   # 上一次标点恢复对应的原文
         self._pending_punctuated = ""  # 其恢复结果（含标点）
@@ -137,13 +143,20 @@ class StreamingTranscriber:
 
     # ------------------------------------------------------------------ 服务生命周期
 
-    def start_transcription(self, audio_queue: queue.Queue, text_queue: queue.Queue):
-        """开始转写服务（接口与 WhisperTranscriber 一致）"""
+    def start_transcription(self, audio_queue: queue.Queue, text_queue: queue.Queue,
+                            display_queue: queue.Queue = None):
+        """开始转写服务（接口与 WhisperTranscriber 一致，display_queue 为可选扩展）。
+
+        display_queue：原文直通显示通道（main.py 传入 translation_queue）。
+        每个分段一旦稳定即推送 {'type': 'seg_original', ...} 事件，显示端立即
+        追加原文，不必等翻译；译文随后由翻译线程以 seg_translation 事件追加。
+        """
         if self.running:
             logger.warning("转写服务已在运行")
             return
         if self.recognizer is None:
             self.load_model()
+        self._display_queue = display_queue
 
         self._stream = self.recognizer.create_stream()
         self._stream_started = False
@@ -223,9 +236,7 @@ class StreamingTranscriber:
 
         # 端点触发 → 产出该句剩余部分并复位流（已提前输出的前缀不再重复）
         if self.recognizer.is_endpoint(self._stream):
-            tail = partial[self._committed_len:] if self._committed_len else partial
-            self._emit(tail.strip(), timestamp, text_queue)
-            self._reset_stream()
+            self._flush_endpoint(partial, timestamp, text_queue)
 
     def _current_result(self) -> str:
         try:
@@ -233,6 +244,20 @@ class StreamingTranscriber:
             return res.text
         except AttributeError:
             return self.recognizer.get_result(self._stream)
+
+    def _flush_endpoint(self, partial: str, timestamp: float, text_queue: queue.Queue):
+        """端点触发收尾：输出该句剩余部分（sentence_end 标记句末）并复位流。
+
+        - 剩余部分非空 → 正常输出（显示端追加后换句）
+        - 剩余为空但本轮已有提前输出的分段 → 补一个句末标记事件，
+          让显示端把"以逗号收尾"的行标记为已完结，下一句到来时清屏
+        """
+        tail = partial[self._committed_len:] if self._committed_len else partial
+        if tail.strip():
+            self._emit(tail.strip(), timestamp, text_queue, sentence_end=True)
+        elif self._committed_len:
+            self._push_original_event("", sentence_end=True)
+        self._reset_stream()
 
     def _reset_stream(self):
         """复位识别流：reset 保留解码器状态清理，等价于开启新语句"""
@@ -253,12 +278,14 @@ class StreamingTranscriber:
         self._pending_punctuated = ""
 
     def _maybe_early_emit(self, partial: str, timestamp: float, text_queue: queue.Queue):
-        """断句符号稳定检测 → 提前出字幕。
+        """断句符号稳定检测 → 提前出字幕（按小句逐个提交）。
 
-        流式识别过程中，标点模型周期性作用于尚未输出的原文片段；当某个以断句
-        符号（，。？！；等）结尾的句子在 early_emit_stable_sec 内未被修正，即
-        认为相对稳定，直接输出，不再等整句说完的静音端点。已输出部分记录在
-        _committed_len，端点触发时只输出剩余部分，避免重复字幕。
+        流式识别过程中，标点模型周期性作用于尚未输出的原文片段；取**第一个**
+        未提交的断句符号（，。？！；等）前的内容作为候选句——这样后续语音继续
+        时标点模型补充的新符号不会改变当前候选，小句各自独立计时，说话不停顿
+        也能逐小句输出。候选在 early_emit_stable_sec 内未被修正即认为相对稳定，
+        直接输出，不再等整句说完的静音端点。已输出部分记录在 _committed_len，
+        端点触发时只输出剩余部分，避免重复字幕。
         """
         if self.punct is None or not partial:
             return
@@ -275,14 +302,15 @@ class StreamingTranscriber:
             self._pending_punct_key = pending_raw
 
         punctuated = self._pending_punctuated
-        last_idx = -1
+        first_idx = -1
         for i, ch in enumerate(punctuated):
             if ch in self.break_puncts:
-                last_idx = i
-        if last_idx < 0:
+                first_idx = i
+                break
+        if first_idx < 0:
             self._candidate = ""  # 修正后断句符号消失，候选作废
             return
-        candidate = punctuated[:last_idx + 1]
+        candidate = punctuated[:first_idx + 1]
 
         if candidate != self._candidate:
             # 新候选（或候选被修正）：重新计时
@@ -313,7 +341,9 @@ class StreamingTranscriber:
         if pos < len(cand_compact):
             return
 
-        self._emit(candidate, timestamp, text_queue, punctuated_already=True)
+        sentence_end = candidate[-1] in self.final_puncts
+        self._emit(candidate, timestamp, text_queue,
+                   punctuated_already=True, sentence_end=sentence_end)
         self._committed_len += consumed
         self._candidate = ""
         self._pending_punct_key = ""
@@ -326,7 +356,7 @@ class StreamingTranscriber:
         return ''.join(ch for ch in text if ch.isalnum()).lower()
 
     def _emit(self, text: str, timestamp: float, text_queue: queue.Queue,
-              punctuated_already: bool = False):
+              punctuated_already: bool = False, sentence_end: bool = False):
         if not text:
             return
         clean = sanitize_text(text)
@@ -338,10 +368,15 @@ class StreamingTranscriber:
         if len(clean) > 1 and clean != self._last_text:
             self._last_text = clean
             logger.info(f"流式转写结果: {clean}")
+            # 原文直通显示：分段稳定即上屏，不等翻译。推送失败时条目带
+            # seg=False，翻译结果将携带原文兜底显示（保证原文不丢）
+            seg_pushed = self._push_original_event(clean, sentence_end)
             item = {
                 'text': clean,
                 'timestamp': time.time(),
                 'first_timestamp': timestamp,
+                'seg': seg_pushed,          # True：显示端已直收原文，译文走追加通道
+                'sentence_end': sentence_end,
             }
             try:
                 text_queue.put(item, timeout=0.5)
@@ -353,6 +388,26 @@ class StreamingTranscriber:
                     logger.warning("文本队列已满，已丢弃最旧字幕以保住最新结果")
                 except Exception:
                     logger.warning("文本队列已满，丢弃结果")
+
+    def _push_original_event(self, text: str, sentence_end: bool) -> bool:
+        """把刚稳定的原文分段直推显示端（不等翻译），返回是否推送成功。
+
+        text 为空时只发句末标记（显示端据此换句，不追加内容）。
+        """
+        if self._display_queue is None:
+            return False
+        event = {
+            'type': 'seg_original',
+            'text': text,
+            'sentence_end': sentence_end,
+            'timestamp': time.time(),
+        }
+        try:
+            self._display_queue.put(event, timeout=0.2)
+            return True
+        except queue.Full:
+            logger.warning("显示通道拥塞，本分段原文改由翻译结果携带兜底")
+            return False
 
     def _convert_audio_data(self, audio_data: bytes) -> Optional[np.ndarray]:
         try:

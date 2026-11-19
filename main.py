@@ -150,11 +150,20 @@ class RealtimeSubtitleSystem:
             # 启动音频捕获
             self.audio_capturer.start_capture()
 
-            # 启动语音转写
-            self.whisper_transcriber.start_transcription(
-                self.audio_capturer.audio_queue,
-                self.text_queue
-            )
+            # 启动语音转写：流式后端额外接 display_queue（translation_queue 兼作
+            # 显示通道），分段原文稳定即直推浮窗上屏，不等翻译
+            backend = self.config['whisper'].get('backend', 'faster-whisper')
+            if backend == 'sherpa-stream':
+                self.whisper_transcriber.start_transcription(
+                    self.audio_capturer.audio_queue,
+                    self.text_queue,
+                    display_queue=self.translation_queue
+                )
+            else:
+                self.whisper_transcriber.start_transcription(
+                    self.audio_capturer.audio_queue,
+                    self.text_queue
+                )
 
             # 运行标志必须在启动任何 worker 线程之前置位：
             # 所有消费线程都是 while self.running 循环，不置位会导致线程
@@ -207,15 +216,27 @@ class RealtimeSubtitleSystem:
                         # 处理可能的元数据格式
                         if isinstance(text_item, dict):
                             text = text_item['text']
+                            seg_mode = bool(text_item.get('seg'))
                         else:
                             text = text_item
+                            seg_mode = False
 
-                        # 构造只有原文的结果
-                        result = {
-                            'original': text,
-                            'translations': {'en': text, 'ja': text, 'ko': text},
-                            'timestamp': self._get_current_timestamp()
-                        }
+                        if seg_mode:
+                            # 分段模式：原文已由转写端直推显示端，这里只补一个
+                            # 空译文事件让显示端流程对齐（直通模式无译文可追加）
+                            result = {
+                                'type': 'seg_translation',
+                                'translations': {},
+                                'original': text,
+                                'timestamp': self._get_current_timestamp()
+                            }
+                        else:
+                            # 构造只有原文的结果
+                            result = {
+                                'original': text,
+                                'translations': {'en': text, 'ja': text, 'ko': text},
+                                'timestamp': self._get_current_timestamp()
+                            }
                         try:
                             self.translation_queue.put(result, timeout=0.1)
                         except queue.Full:
@@ -264,13 +285,25 @@ class RealtimeSubtitleSystem:
                     continue
                 try:
                     if isinstance(result, dict):
-                        original = result.get('original', '')
-                        translations = result.get('translations', {})
-                        # 原文在前，翻译按序拼接；直通模式下翻译与原文相同，去重后只显示一条
-                        parts = [original] + [
-                            v for v in translations.values() if v and v != original
-                        ]
-                        line = ' | '.join(dict.fromkeys(p for p in parts if p))
+                        etype = result.get('type')
+                        if etype == 'seg_original':
+                            # 分段原文直通事件：立即显示（不等翻译）
+                            line = str(result.get('text') or '')
+                        elif etype == 'seg_translation':
+                            # 分段译文事件：追加显示（原文已随 seg_original 显示过）
+                            original = result.get('original')
+                            vals = [str(v) for v in (result.get('translations') or {}).values()
+                                    if v and str(v) != str(original or '')]
+                            line = ' | '.join(dict.fromkeys(vals))
+                        else:
+                            # 合并格式（整句路径）：原文+译文一行
+                            original = result.get('original', '')
+                            translations = result.get('translations', {})
+                            # 原文在前，翻译按序拼接；直通模式下翻译与原文相同，去重后只显示一条
+                            parts = [original] + [
+                                v for v in translations.values() if v and v != original
+                            ]
+                            line = ' | '.join(dict.fromkeys(p for p in parts if p))
                     else:
                         line = str(result)
                     if line:

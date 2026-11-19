@@ -19,7 +19,9 @@ class SubtitleWindow(QWidget):
     """字幕浮窗：上半部分显示识别原文，下半部分显示翻译文本。
 
     - 无边框、置顶、半透明圆角背景，默认停靠屏幕底部居中，可按住左键拖动
-    - 内容整体替换式（同视频字幕）：新字幕到达后覆盖上一条，不做滚动/飘过动画
+    - 分段追加式：流式模式下小句一旦稳定，原文立即追加到当前行（不等翻译），
+      译文就绪后逐条追加到译文缓冲区；句末标记后，下一句到来时清屏换行
+    - 整句路径（合并格式，如 faster-whisper 后端）：维持"新句替换旧句"
     - 跨线程数据经 subtitle_queue 由 Qt 定时器在主线程消费，控件只在 Qt 线程更新
     """
 
@@ -32,6 +34,10 @@ class SubtitleWindow(QWidget):
         self._user_moved = False  # 用户拖动后不再自动回到底部居中
         self._width = 0
         self._y_offset = 100
+        # 分段追加缓冲区：当前句的原文小句 / 译文小句（翻译缓冲区）
+        self._orig_parts: list = []
+        self._trans_parts: list = []
+        self._sentence_ended = False  # 上一分段是否句末；下一分段到来时清屏换句
         self.init_ui()
         self.setup_timer()
 
@@ -124,37 +130,86 @@ class SubtitleWindow(QWidget):
             logger.error(f"更新字幕失败: {e}")
 
     def add_subtitle(self, data: dict):
-        """更新浮窗内容（必须在 Qt 线程内调用，经定时器驱动）"""
+        """处理字幕事件（必须在 Qt 线程内调用，经定时器驱动）。
+
+        三种事件：
+        - seg_original：转写端刚稳定的原文小句 → 追加到原文行立即显示（不等翻译）；
+          句末标记（sentence_end）在追加后置位，下一小句到来时清屏换句
+        - seg_translation：该小句译文就绪 → 追加进译文缓冲区（每个语言一条）
+        - 合并格式（无 type，整句路径）：原文+译文一次性展示并视为句末
+        """
         try:
-            original = str(data.get('original', '') or '')
-            translations = data.get('translations', {}) or {}
+            etype = data.get('type')
+            if etype == 'seg_original':
+                text = str(data.get('text') or '').strip()
+                if self._sentence_ended:
+                    self._reset_buffers()
+                if text:
+                    self._orig_parts.append(text)
+                self._sentence_ended = bool(data.get('sentence_end'))
+            elif etype == 'seg_translation':
+                self._trans_parts.extend(
+                    self._ordered_translations(data.get('translations') or {}))
+            else:
+                original = str(data.get('original', '') or '')
+                translations = data.get('translations', {}) or {}
+                if self._sentence_ended:
+                    self._reset_buffers()
+                if original:
+                    self._orig_parts.append(original)
+                self._trans_parts.extend(
+                    t for t in self._ordered_translations(translations)
+                    if t != original)
+                # 整句路径默认句末（whisper 后端/直通）；sherpa 拥塞兜底的合并
+                # 条目会显式携带 sentence_end，按条目标记为准
+                self._sentence_ended = bool(data.get('sentence_end', True))
 
-            # 译文按配置的目标语言顺序排列；与原文相同的译文（直通模式）不重复展示
-            parts = []
-            for lang in self.config['translation'].get('target_languages', []):
-                v = translations.get(lang)
-                if v and str(v) != original:
-                    parts.append(str(v))
-            # 兜底：target_languages 之外的译文也展示（去重、保持顺序）
-            for k, v in translations.items():
-                if v and str(v) != original and str(v) not in parts:
-                    parts.append(str(v))
-
-            if not original and not parts:
-                return
-
-            original_display = self._clip(original)
-            translation_display = "\n".join(parts)
-
-            self.original_label.setText(original_display)
-            self.translation_label.setText(translation_display)
-            self._current_text = f"{original_display}|{translation_display}"
-            self._update_geometry()
-            if not self.isVisible():
-                self.show()
-            logger.debug(f"更新字幕: {original_display[:50]}")
+            self._render()
         except Exception as e:
             logger.error(f"添加字幕失败: {e}")
+
+    def _reset_buffers(self):
+        """清空追加缓冲区（换句）"""
+        self._orig_parts.clear()
+        self._trans_parts.clear()
+
+    def _ordered_translations(self, translations: dict) -> list:
+        """按配置目标语言顺序取译文，其余语言兜底追加（去重、保持顺序）"""
+        parts = []
+        for lang in self.config['translation'].get('target_languages', []):
+            v = translations.get(lang)
+            if v and str(v) not in parts:
+                parts.append(str(v))
+        for k, v in translations.items():
+            if v and str(v) not in parts:
+                parts.append(str(v))
+        return parts
+
+    def _render(self):
+        """把追加缓冲区渲染到浮窗（缓冲区超长时丢弃最旧的小句）"""
+        self._trim_parts(self._orig_parts, MAX_TEXT_LEN)
+        self._trim_parts(self._trans_parts, MAX_TEXT_LEN)
+
+        original_display = self._clip("".join(self._orig_parts))
+        translation_display = self._clip("\n".join(self._trans_parts))
+
+        if not original_display and not translation_display:
+            return
+
+        self.original_label.setText(original_display)
+        self.translation_label.setText(translation_display)
+        self._current_text = f"{original_display}|{translation_display}"
+        self._update_geometry()
+        if not self.isVisible():
+            self.show()
+        logger.debug(f"更新字幕: {original_display[:50]}")
+
+    @staticmethod
+    def _trim_parts(parts: list, max_len: int):
+        """累计长度超限时从最旧的小句开始丢弃，保住最新内容"""
+        total = sum(len(p) for p in parts)
+        while parts and total > max_len:
+            total -= len(parts.pop(0))
 
     @staticmethod
     def _clip(text: str) -> str:
@@ -229,6 +284,8 @@ class SubtitleWindow(QWidget):
         self.original_label.setText("")
         self.translation_label.setText("")
         self._current_text = ""
+        self._reset_buffers()
+        self._sentence_ended = False
         logger.info("已清空字幕浮窗内容")
 
 

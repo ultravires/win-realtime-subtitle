@@ -83,20 +83,37 @@ class SimpleTranslator:
         """翻译主循环"""
         while self.running:
             try:
-                # 获取待翻译文本
-                text = text_queue.get(timeout=1.0)
+                # 获取待翻译文本（兼容纯文本与带元数据的 dict 两种格式）
+                item = text_queue.get(timeout=1.0)
+                if not item:
+                    continue
+                seg_mode = False
+                if isinstance(item, dict):
+                    text = item.get('text', '')
+                    seg_mode = bool(item.get('seg'))
+                else:
+                    text = item
                 if not text:
                     continue
-                
+
                 # 执行多语言翻译
                 translations = self.translate_text(text, self.target_languages)
-                
-                # 构造翻译结果
-                translation_result = {
-                    'original': text,
-                    'translations': translations,
-                    'timestamp': self._get_current_timestamp()
-                }
+
+                # 构造翻译结果：分段模式只发译文事件（原文已由转写端直推显示端），
+                # 整句模式沿用合并格式
+                if seg_mode:
+                    translation_result = {
+                        'type': 'seg_translation',
+                        'translations': translations,
+                        'original': text,
+                        'timestamp': self._get_current_timestamp()
+                    }
+                else:
+                    translation_result = {
+                        'original': text,
+                        'translations': translations,
+                        'timestamp': self._get_current_timestamp()
+                    }
                 
                 logger.info(f"翻译完成: {text}")
                 

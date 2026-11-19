@@ -166,26 +166,39 @@ class TencentTranslator:
                 if not item:
                     continue
                 first_ts = None
+                seg_mode = False
                 if isinstance(item, dict):
                     first_ts = item.get('first_timestamp')
                     text = item.get('text', '')
+                    seg_mode = bool(item.get('seg'))
                 else:
                     text = item
                 if not text:
                     continue
-                
+
                 # 执行多语言翻译
                 translations = self.translate_text(text, self.target_languages)
-                
-                # 构造翻译结果
-                translation_result = {
-                    'original': text,
-                    'translations': translations,
-                    'timestamp': self._get_current_timestamp()
-                }
+
+                # 构造翻译结果：
+                # - 分段模式（seg=True）：原文已由转写端直推显示端上屏，
+                #   这里只发译文事件，显示端追加进译文缓冲区
+                # - 整句模式：沿用合并格式（原文+译文一起展示）
+                if seg_mode:
+                    translation_result = {
+                        'type': 'seg_translation',
+                        'translations': translations,
+                        'original': text,
+                        'timestamp': self._get_current_timestamp()
+                    }
+                else:
+                    translation_result = {
+                        'original': text,
+                        'translations': translations,
+                        'timestamp': self._get_current_timestamp()
+                    }
                 if first_ts is not None:
                     translation_result['first_timestamp'] = first_ts
-                
+
                 logger.info(f"翻译完成: {text} -> {list(translations.values())}")
                 
                 # 放入翻译结果队列
