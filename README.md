@@ -146,14 +146,22 @@ python check_env.py
 ### 音频配置
 ```yaml
 audio:
-  sample_rate: 16000     # 采样率
-  channels: 1           # 声道数
-  chunk_duration: 2     # 块时长(秒)
-  buffer_size: 30       # 缓冲区大小
-  volume_threshold: 100 # 静音阈值
+  # 音频来源：microphone = 麦克风；system = 系统播放声音（扬声器回环）；
+  #           application = 只捕获指定应用的声音（Win10 2004+，无需虚拟声卡）
+  source: "microphone"
+  device: ""             # 设备名子串（如 "HyperX"），留空 = 系统默认设备
+  target_process: ""     # application 模式目标：进程名/PID，留空 = 启动时交互选择
+  sample_rate: 16000     # 采样率（固定 16k 下游契约）
+  channels: 1           # 声道数（自动混合为单声道）
+  chunk_duration: 0.5   # 块时长(秒)
+  buffer_size: 20       # 缓冲区大小
+  volume_threshold: 30  # 静音阈值
   max_consecutive_silence: 5  # 最大连续静音
   adaptive_buffer: true # 自适应缓冲
 ```
+
+音频来源可用 `python main.py --list-sources` 查看（列出录音/播放设备与正在
+发声的应用）。捕获走 WASAPI（纯 ctypes），无需立体声混音或 virtual-audio-capturer。
 
 ### Whisper配置
 ```yaml

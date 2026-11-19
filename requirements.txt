@@ -1,7 +1,5 @@
-# 音频处理
-ffmpeg-python==0.2.0
-sounddevice==0.4.6
-pyaudio==0.2.12
+# 音频处理：捕获走 WASAPI（audio_capture/wasapi_capture.py，纯 ctypes，无 ffmpeg/pyaudio 依赖）
+# 重采样需要 scipy（下方工具库中已列）
 
 # 语音识别
 faster-whisper==1.2.1

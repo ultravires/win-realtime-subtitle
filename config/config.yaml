@@ -2,8 +2,17 @@
 
 # 音频捕获配置
 audio:
-  sample_rate: 16000  # 采样率 Hz
-  channels: 1         # 声道数
+  # 音频来源：microphone = 麦克风输入；system = 系统播放的声音（扬声器回环）；
+  #           application = 只捕获指定应用的声音（Windows 10 2004+）
+  source: "microphone"
+  # microphone/system 模式：设备名子串匹配（如 "HyperX"、"Ditoo"）；留空 = 系统默认设备
+  # 可用设备/应用可用 `python main.py --list-sources` 查看
+  device: ""
+  # application 模式：目标应用（进程名如 "chrome"，或数字 PID）；留空 = 启动时从
+  # 正在发声/注册过音频会话的应用中交互选择。捕获范围含目标进程的全部子进程。
+  target_process: ""
+  sample_rate: 16000  # 采样率 Hz（下游固定按 16kHz 处理）
+  channels: 1         # 声道数（捕获端自动混合为单声道）
   chunk_duration: 0.5   # 音频块时长（秒）—— 小块便于低延迟拼窗
   buffer_size: 20     # 队列缓冲大小（从10增加到30）
   volume_threshold: 30  # 音量阈值，低于此值视为静音

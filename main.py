@@ -11,6 +11,7 @@ import queue
 import signal
 import sys
 import time
+import argparse
 from loguru import logger
 
 from utils.helpers import load_config, setup_logging
@@ -27,7 +28,7 @@ SHUTDOWN_FORCE_EXIT_SEC = 20.0
 class RealtimeSubtitleSystem:
     """实时字幕系统主类 - 优化版本"""
 
-    def __init__(self, config_path: str = "config/config.yaml"):
+    def __init__(self, config_path: str = "config/config.yaml", overrides: dict = None):
         # ---- 退出状态标志：必须最先定义（信号处理器/看门狗任何时刻都可能访问）----
         self.running = False
         self._stopped = False
@@ -50,8 +51,12 @@ class RealtimeSubtitleSystem:
         # 在 __init__ 启动（而非 start()），覆盖模型加载等启动阶段的 Ctrl+C
         self._start_exit_watchdog()
 
-        # 加载配置
+        # 加载配置（CLI 覆盖项随后应用，优先级高于配置文件）
         self.config = load_config(config_path)
+        for key, value in (overrides or {}).items():
+            if value:
+                self.config['audio'][key] = value
+                logger.info(f"CLI 覆盖音频配置: audio.{key} = {value}")
 
         # 设置日志（尽早，保证后续每个阶段都有输出）
         setup_logging(self.config['system']['log_level'])
@@ -508,11 +513,68 @@ class RealtimeSubtitleSystem:
         """获取当前时间戳"""
         return time.time()
 
+def _print_audio_sources():
+    """--list-sources：列出可用音频来源（设备 / 应用会话），不加载模型"""
+    from audio_capture.wasapi_capture import (
+        list_capture_devices, list_render_devices, list_audio_sessions)
+
+    print("=" * 60)
+    print("可用音频来源（用于 config.yaml 的 audio 配置节）")
+    print("=" * 60)
+
+    try:
+        print("\n[microphone 模式] 录音输入设备 (audio.device 名称子串):")
+        for name, is_default in list_capture_devices():
+            print(f"  {'[默认] ' if is_default else '       '}{name}")
+    except Exception as e:
+        print(f"  枚举失败: {e}")
+
+    try:
+        print("\n[system 模式] 播放输出设备（回环目标，audio.device 名称子串）:")
+        for name, is_default in list_render_devices():
+            print(f"  {'[默认] ' if is_default else '       '}{name}")
+    except Exception as e:
+        print(f"  枚举失败: {e}")
+
+    try:
+        print("\n[application 模式] 有音频会话的应用 (audio.target_process 进程名/PID):")
+        sessions = list_audio_sessions()
+        if not sessions:
+            print("  （当前无已注册音频会话的应用；让目标应用播放一段声音后重试）")
+        for s in sessions:
+            mark = "◉ 正在发声" if s["active"] else "○ 待机    "
+            print(f"  {mark}  {s['name']}  (PID {s['pid']})")
+    except Exception as e:
+        print(f"  枚举失败: {e}")
+
+    print("\n提示: audio.source 可选 microphone / system / application；"
+          "device 留空=系统默认设备；application 模式下 target_process 留空则启动时交互选择。")
+
+
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description="实时多语言字幕系统")
+    parser.add_argument("--list-sources", action="store_true",
+                        help="列出可用音频来源（设备与应用会话）后退出，不加载模型")
+    parser.add_argument("--audio-source", choices=["microphone", "system", "application"],
+                        help="覆盖配置文件中的 audio.source")
+    parser.add_argument("--audio-device", help="覆盖 audio.device（设备名子串，留空=默认设备）")
+    parser.add_argument("--audio-target", help="覆盖 audio.target_process（application 模式的进程名/PID）")
+    args = parser.parse_args()
+
     try:
+        if args.list_sources:
+            _print_audio_sources()
+            return
+
+        overrides = {
+            'source': args.audio_source,
+            'device': args.audio_device,
+            'target_process': args.audio_target,
+        }
+
         # 创建系统实例
-        system = RealtimeSubtitleSystem()
+        system = RealtimeSubtitleSystem(overrides=overrides)
 
         # 启动系统
         system.start()

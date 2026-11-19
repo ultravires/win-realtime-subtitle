@@ -41,9 +41,12 @@ brew install ffmpeg
 
 ### 2. 首次运行
 
-1. **配置音频设备**
-   - 确保系统音频设置中有"立体声混音"或类似选项
-   - 在Windows中可能需要在录音设备中启用"立体声混音"
+1. **配置音频来源**（`config/config.yaml` 的 `audio` 节）
+   - `source: "microphone"` 麦克风；`"system"` 系统播放的全部声音（扬声器回环，
+     无需立体声混音）；`"application"` 只捕获某个应用的声音（如会议软件、播放器）
+   - 可用 `python main.py --list-sources` 查看设备与应用列表
+   - `application` 模式用 `target_process: "chrome"`（进程名）或数字 PID 指定目标，
+     留空则启动时在控制台从正在发声的应用中选择
 
 2. **运行系统**
 ```bash
