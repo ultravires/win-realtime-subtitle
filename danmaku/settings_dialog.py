@@ -168,30 +168,35 @@ class SettingsDialog(QDialog):
 
     # ------------------------------------------------------------------ 保存
 
+    def _picked_or_typed(self) -> str:
+        """取设备/应用选择结果：选中列表项返回其 data；手动输入返回文本。
+
+        可编辑 QComboBox 的坑：用户键入新文本时 currentIndex 仍停在原选中项，
+        currentData() 会返回**陈旧项**的 data 而非 None——必须比对当前文本
+        是否等于选中项的显示文本，不一致即视为手动输入。
+        """
+        text = self.device_combo.currentText().strip()
+        idx = self.device_combo.currentIndex()
+        item_text = self.device_combo.itemText(idx) if idx >= 0 else None
+        if text and (item_text is None or text != item_text):
+            return text  # 手动输入（设备名子串/进程名/PID）
+        data = self.device_combo.currentData()
+        return '' if data is None else str(data)
+
     def _on_save(self):
         source = self.source_combo.currentData()
-        text = self.device_combo.currentText().strip()
-        data = self.device_combo.currentData()
+        picked = self._picked_or_typed()
 
         self.config['audio']['source'] = source
         if source == 'application':
-            # 选择的应用会话项 data 为 PID；手动输入文本原样保存（进程名/PID 均可）
-            self.config['audio']['target_process'] = ''
-            if data is None and text:
-                self.config['audio']['target_process'] = text
-            elif data:
-                self.config['audio']['target_process'] = str(data)
+            # 应用会话项保存 PID；手动输入文本原样保存（进程名/PID 均可）
+            self.config['audio']['target_process'] = picked
             logger.info(f"设置声音来源: application (target_process="
-                        f"{self.config['audio']['target_process'] or '启动时选择'})")
+                        f"{picked or '启动时选择'})")
         else:
-            # 设备项 data 为设备名；默认项 data 为空串；手动输入按子串匹配保存
-            device = ''
-            if data is None and text:
-                device = text
-            elif data:
-                device = str(data)
-            self.config['audio']['device'] = device
-            logger.info(f"设置声音来源: {source} (device={device or '默认设备'})")
+            # 设备名按子串匹配保存；空串=系统默认设备
+            self.config['audio']['device'] = picked
+            logger.info(f"设置声音来源: {source} (device={picked or '默认设备'})")
 
         self.config['translation']['enabled'] = self.translate_check.isChecked()
         langs = [code for code, cb in self.lang_checks if cb.isChecked()]
