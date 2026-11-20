@@ -4,6 +4,13 @@
 
 这是一个基于Whisper和大语言模型的实时多语言字幕系统，能够实时捕获系统音频、进行语音识别，并将识别结果翻译成多种语言，最后以弹幕形式展示。
 
+## 🆕 2026-11-21 更新
+
+- **Silero VAD 语音活动检测**（`vad` 配置节，`models/silero_vad.onnx`）：音量达标但非语音的音频（噪声/呼吸/背景音乐）置零后送入识别流，显著减少静音与噪声段的幻觉字幕；模型缺失时自动回退纯音量阈值。测试：`python test_vad.py`
+- **翻译积压治理**：翻译一条小句约 2s，说话快于翻译时队列积压、译文越落越后。现在翻译线程会把积压的小句**合并成一批、一次生成完成整批翻译**（`translation.batch_max_items`，默认 6；无积压时不等待、零额外延迟），积压自动收敛。测试：`python test_translation_batch.py`
+- **界面设置**：字幕浮窗**右键 → 设置…**，可视化选择声音来源（麦克风/系统音频/指定应用，带设备与应用会话列表）与翻译目标语言。翻译语言保存后**立即生效**；声音来源写入配置、重启程序生效。测试：`python test_settings_dialog.py`
+- **二进制可执行程序**：`pyinstaller --noconfirm RealtimeSubtitle.spec`，产物 `dist/RealtimeSubtitle/RealtimeSubtitle.exe`（onedir 目录形态）。分发时把 `models/` 放在 exe 旁；详见 [PACKAGING.md](PACKAGING.md)
+
 ## ⚠️ 重要通知 - CUDA兼容性问题
 
 **注意**: 如果您使用的是RTX 40系列显卡（如RTX 5070 Ti），可能会遇到CUDA兼容性问题。请参考 [CUDA兼容性解决方案](CUDA_COMPATIBILITY_SOLUTION.md) 文档。

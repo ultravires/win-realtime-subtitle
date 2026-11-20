@@ -17,6 +17,14 @@ class TencentTranslator:
         self.target_languages = config['translation']['target_languages']
         self.running = False
         self.translate_thread: Optional[threading.Thread] = None
+
+        # 批量合并翻译：翻译一条小句约 2s（生成耗时），说话节奏快于翻译时
+        # 会在 text_queue 积压，译文越落越后。把队列里已积压的小句合并成
+        # 一批、一次生成完成整批翻译（合并调用摊薄固定开销，输出吞吐不变）
+        tcfg = config['translation']
+        self.max_new_tokens = int(tcfg.get('max_new_tokens', 100))
+        self.batch_max_items = int(tcfg.get('batch_max_items', 6))
+        self.batch_max_new_tokens = int(tcfg.get('batch_max_new_tokens', 512))
         
         # 语言映射表
         self.language_names = {
@@ -158,77 +166,121 @@ class TencentTranslator:
         logger.info("翻译服务已停止")
     
     def _translate_loop(self, text_queue: queue.Queue, translation_queue: queue.Queue):
-        """翻译主循环"""
+        """翻译主循环：单条取出 + 积压合并成批翻译"""
         while self.running:
             try:
                 # 获取待翻译文本（兼容纯文本与带元数据的 dict 两种格式）
                 item = text_queue.get(timeout=1.0)
                 if not item:
                     continue
-                first_ts = None
-                seg_mode = False
-                if isinstance(item, dict):
-                    first_ts = item.get('first_timestamp')
-                    text = item.get('text', '')
-                    seg_mode = bool(item.get('seg'))
-                else:
-                    text = item
-                if not text:
-                    continue
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"取待翻译文本失败: {e}")
+                continue
 
-                # 执行多语言翻译
-                translations = self.translate_text(text, self.target_languages)
-
-                # 构造翻译结果：
-                # - 分段模式（seg=True）：原文已由转写端直推显示端上屏，
-                #   这里只发译文事件，显示端追加进译文缓冲区
-                # - 整句模式：沿用合并格式（原文+译文一起展示）
-                if seg_mode:
-                    translation_result = {
-                        'type': 'seg_translation',
-                        'translations': translations,
-                        'original': text,
-                        'timestamp': self._get_current_timestamp()
-                    }
-                else:
-                    translation_result = {
-                        'original': text,
-                        'translations': translations,
-                        'timestamp': self._get_current_timestamp()
-                    }
-                if first_ts is not None:
-                    translation_result['first_timestamp'] = first_ts
-
-                logger.info(f"翻译完成: {text} -> {list(translations.values())}")
-                
-                # 放入翻译结果队列
-                try:
-                    translation_queue.put(translation_result, timeout=0.1)
-                except queue.Full:
-                    logger.warning("翻译队列已满，丢弃结果")
-                
+            try:
+                batch = self._collect_batch(item, text_queue)
+                self._translate_batch(batch, translation_queue)
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"翻译过程中发生错误: {e}")
                 continue
-    
-    def translate_text(self, text: str, target_languages: List[str]) -> Dict[str, str]:
-        """翻译文本到多种语言"""
+
+    def _collect_batch(self, first: object, text_queue: queue.Queue) -> List[object]:
+        """取出首批 + 队列中已积压的小句，合并为一批（上限 batch_max_items）。
+
+        无积压时立即返回单条（不额外等待、不增加延迟）；有积压时一次
+        get_nowait 循环全部取出，整批一次生成完成翻译。超出上限的部分
+        留在队列里下一轮继续（配合转写端"保新弃旧"，积压有硬上限）。
+        """
+        batch = [first]
+        while len(batch) < self.batch_max_items:
+            try:
+                nxt = text_queue.get_nowait()
+            except queue.Empty:
+                break
+            if nxt:
+                batch.append(nxt)
+        if len(batch) > 1:
+            logger.info(f"翻译积压合并: {len(batch)} 条小句一次生成")
+        return batch
+
+    def _translate_batch(self, batch: List[object], translation_queue: queue.Queue):
+        """翻译一批小句：合并文本单次生成（每个目标语言一次调用），
+        构造一条合并结果事件；分段模式下显示端把整批译文一次追加进缓冲区"""
+        texts = []
+        seg_flags = []
+        first_tss = []
+        for it in batch:
+            if isinstance(it, dict):
+                texts.append(str(it.get('text') or ''))
+                seg_flags.append(bool(it.get('seg')))
+                ts = it.get('first_timestamp')
+                if ts is not None:
+                    first_tss.append(ts)
+            else:
+                texts.append(str(it))
+                seg_flags.append(False)
+        texts = [t for t in texts if t.strip()]
+        if not texts:
+            return
+
+        merged_text = '\n'.join(texts)
+        # 分段模式（seg=True）：原文已由转写端直推显示端上屏，这里只发译文
+        # 事件，显示端把整批译文追加进译文缓冲区；整句模式沿用合并格式
+        seg_mode = any(seg_flags)
+        # 输出上限随批内条数放大（每条约需 max_new_tokens 的生成预算），
+        # 封顶 batch_max_new_tokens 防止单批生成过长拖慢整体节奏
+        max_new = min(self.max_new_tokens * len(texts), self.batch_max_new_tokens)
+        translations = self.translate_text(merged_text, self.target_languages,
+                                           max_new_tokens=max_new)
+
+        if seg_mode:
+            translation_result = {
+                'type': 'seg_translation',
+                'translations': translations,
+                'original': merged_text,
+                'timestamp': self._get_current_timestamp()
+            }
+        else:
+            translation_result = {
+                'original': merged_text,
+                'translations': translations,
+                'timestamp': self._get_current_timestamp()
+            }
+        if first_tss:
+            translation_result['first_timestamp'] = min(first_tss)
+
+        logger.info(f"翻译完成 ({len(texts)} 条合并): "
+                    f"{merged_text[:40]}{'…' if len(merged_text) > 40 else ''} "
+                    f"-> {list(translations.values())}")
+
+        # 放入翻译结果队列
+        try:
+            translation_queue.put(translation_result, timeout=0.1)
+        except queue.Full:
+            logger.warning("翻译队列已满，丢弃结果")
+
+    def translate_text(self, text: str, target_languages: List[str],
+                       max_new_tokens: int = None) -> Dict[str, str]:
+        """翻译文本到多种语言（max_new_tokens 为空时用配置默认值）"""
         translations = {}
-        
+
         for lang in target_languages:
             try:
-                translated = self._translate_single(text, lang)
+                translated = self._translate_single(text, lang, max_new_tokens)
                 if translated:
                     translations[lang] = translated
             except Exception as e:
                 logger.error(f"{lang}翻译失败: {e}")
                 translations[lang] = ""
-        
+
         return translations
-    
-    def _translate_single(self, text: str, target_lang: str) -> str:
+
+    def _translate_single(self, text: str, target_lang: str,
+                          max_new_tokens: int = None) -> str:
         """翻译到单个语言（使用HY-MT官方提示词格式）"""
         try:
             # HY-MT官方格式：将下面的文本翻译成{目标语言}，不要额外解释。{原文}
@@ -249,7 +301,7 @@ class TencentTranslator:
             # 生成翻译
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.config['translation']['max_new_tokens'],
+                max_new_tokens=max_new_tokens or self.max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id

@@ -17,3 +17,9 @@ test_audio/
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec.bak
+build_exe.log

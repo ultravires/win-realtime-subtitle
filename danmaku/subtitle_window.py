@@ -2,7 +2,7 @@ import queue
 import sys
 from typing import Optional
 
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QMenu
 from PyQt6.QtCore import Qt, QTimer
 from loguru import logger
 
@@ -38,6 +38,9 @@ class SubtitleWindow(QWidget):
         self._orig_parts: list = []
         self._trans_parts: list = []
         self._sentence_ended = False  # 上一分段是否句末；下一分段到来时清屏换句
+        # 右键菜单回调（由 SubtitleManager 注入）：设置对话框 / 退出请求
+        self._settings_opener = None
+        self._quit_requester = None
         self.init_ui()
         self.setup_timer()
 
@@ -273,6 +276,22 @@ class SubtitleWindow(QWidget):
         self._drag_offset = None
         event.accept()
 
+    def contextMenuEvent(self, event):
+        """右键菜单：设置（声音来源/翻译语言）与退出"""
+        menu = QMenu(self)
+        act_settings = menu.addAction("设置…") if self._settings_opener else None
+        act_quit = menu.addAction("退出")
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+        if chosen is act_settings and self._settings_opener:
+            try:
+                self._settings_opener()
+            except Exception as e:
+                logger.error(f"打开设置失败: {e}")
+        elif chosen is act_quit and self._quit_requester:
+            self._quit_requester()
+
     # ---------------------------------------------------------------- 状态与清理
 
     def get_active_count(self) -> int:
@@ -312,6 +331,13 @@ class SubtitleManager:
         self.running = False
         self._quit_timer: Optional[QTimer] = None
         self._quit_requested = False  # 跨线程退出请求标志（request_quit 置位）
+        self._settings_opener = None  # 设置对话框回调（main.py 注入，Qt 主线程调用）
+
+    def set_settings_opener(self, opener):
+        """注入"设置"入口（在浮窗右键菜单触发）。start() 前后调用均可。"""
+        self._settings_opener = opener
+        if self.window is not None:
+            self.window._settings_opener = opener
 
     def start(self):
         """在主线程创建 QApplication 与字幕浮窗并显示（非阻塞，不运行事件循环）。
@@ -325,6 +351,9 @@ class SubtitleManager:
             # 只传 argv[0]，避免 Qt 解析 main.py 的命令行参数
             self.app = QApplication(sys.argv[:1])
             self.window = SubtitleWindow(self.config)
+            # 右键菜单入口：设置（main 注入）与退出（走 request_quit 标志位路径）
+            self.window._settings_opener = self._settings_opener
+            self.window._quit_requester = self.request_quit
             # 事件循环退出时清空浮窗内容（aboutToQuit 在主线程内触发）
             self.app.aboutToQuit.connect(self.window.clear_all_subtitles)
             self.window.show()

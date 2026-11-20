@@ -7,6 +7,7 @@ import numpy as np
 from loguru import logger
 
 from utils.helpers import sanitize_text
+from transcription.vad import SpeechVAD
 
 try:
     import sherpa_onnx
@@ -46,6 +47,10 @@ class StreamingTranscriber:
 
         acfg = config['audio']
         self.volume_threshold = acfg.get('volume_threshold', 30)
+
+        # Silero VAD：音量达标但非语音的块（噪声/呼吸/背景音乐）置零喂入，
+        # 减少静音/噪声段的幻觉文本；加载失败自动回退音量阈值判定
+        self.vad = SpeechVAD(config)
 
         # 与 whisper 配置对齐的语言设置：bilingual zh-en 模型按输入自动区分
         self.language_hint = wcfg.get('language', 'zh')
@@ -120,6 +125,7 @@ class StreamingTranscriber:
         logger.info(f"sherpa-onnx 流式模型加载完成: {full_dir} (provider={self.provider})")
 
         self._load_punctuation()
+        self.vad.load()
 
     def _load_punctuation(self):
         """加载标点恢复模型（可选）：给流式结果补 。，？等标点"""
@@ -171,7 +177,8 @@ class StreamingTranscriber:
         self.transcribe_thread.start()
         logger.info(f"流式转写服务已启动 (decoding={self.decoding_method}, "
                     f"endpoint rule1={self.rule1_min_trailing_silence}s, "
-                    f"断句提前出字幕={'开' if self.early_emit_enabled and self.punct is not None else '关'})")
+                    f"断句提前出字幕={'开' if self.early_emit_enabled and self.punct is not None else '关'}, "
+                    f"VAD={'开' if self.vad.available else '关'})")
 
     def stop_transcription(self):
         """停止转写服务"""
@@ -211,11 +218,15 @@ class StreamingTranscriber:
             return
 
         peak = float(np.max(np.abs(audio_np * 32768.0)))
-        if peak <= self.volume_threshold:
+        speech = peak > self.volume_threshold
+        if speech and self.vad is not None and self.vad.available:
+            # 音量达标后由 VAD 二次确认：非语音（噪声/呼吸/背景音乐）置零喂入
+            speech = self.vad.is_speech(audio_np)
+        if speech:
+            self._stream_started = True
+        else:
             # 静音段全长度送入流——端点检测依赖真实静音时长判定句尾
             audio_np = np.zeros(len(audio_np), dtype=np.float32)
-        else:
-            self._stream_started = True
 
         t0 = time.time()
         self._stream.accept_waveform(16000, audio_np)

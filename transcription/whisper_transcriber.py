@@ -7,6 +7,7 @@ import numpy as np
 from loguru import logger
 
 from utils.helpers import sanitize_text
+from transcription.vad import SpeechVAD
 
 try:
     from faster_whisper import WhisperModel
@@ -40,6 +41,9 @@ class WhisperTranscriber:
         acfg = config['audio']
         self.chunk_duration = acfg['chunk_duration']
         self.volume_threshold = acfg.get('volume_threshold', 30)
+
+        # Silero VAD：音量达标但非语音的块按静音处理（噪声幻觉防护）
+        self.vad = SpeechVAD(config)
         self.max_window_sec = wcfg.get('max_window_sec', 4.0)
         self.silence_flush_sec = wcfg.get('silence_flush_sec', 1.0)
         self.min_audio_sec = 0.3  # 窗口太短不送模型，避免碎字幕
@@ -82,6 +86,7 @@ class WhisperTranscriber:
                 compute_type=self.compute_type,
             )
             logger.info(f"faster-whisper 模型加载完成，耗时 {time.time() - t0:.1f}s")
+            self.vad.load()
             self._warmup()
         except Exception as e:
             logger.error(f"Whisper模型加载失败: {e}")
@@ -168,9 +173,12 @@ class WhisperTranscriber:
         now = time.time()
         self._last_chunk_ts = now
 
-        # 自行计算音量（不依赖捕获端的 silent 标记，块粒度一致）
+        # 自行计算音量（不依赖捕获端的 silent 标记，块粒度一致）；
+        # 音量达标再由 VAD 确认是否真为语音，噪声/背景乐按静音处理
         peak = float(np.max(np.abs(audio_np * 32768.0)))
         is_speech = peak > self.volume_threshold
+        if is_speech and self.vad is not None and self.vad.available:
+            is_speech = self.vad.is_speech(audio_np)
 
         if self._window_start_ts is None:
             self._window_start_ts = timestamp

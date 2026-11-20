@@ -42,6 +42,14 @@ streaming:
   early_emit_punctuation: true  # 断句符号稳定提前出字幕：按小句（第一个未提交的 ，。？！； 等符号前的内容）独立计时，stable 秒内未被修正即输出（需加载 punctuation_model）
   early_emit_stable_sec: 1.0    # 小句保持稳定多少秒后提前输出；稳定即直推浮窗上屏，译文随后按小句追加
 
+# 语音活动检测（Silero VAD）：识别前区分语音与噪声
+vad:
+  enabled: true    # false = 关闭，退回纯音量阈值判定
+  model: "models/silero_vad.onnx"  # 2MB 模型文件，缺失时自动回退音量阈值
+  threshold: 0.5           # 语音判定阈值（0-1）
+  min_silence_duration: 0.5  # 语音结束后保持"语音"状态的尾滞后（秒），保护词尾
+  min_speech_duration: 0.25  # 短于此的声音（按键/碰撞）不算语音（秒）
+
 # 翻译模型配置
 translation:
   enabled: true  # false = 不加载翻译模型，仅显示识别原文（省显存、启动更快；CLI --no-translate 可临时覆盖）
@@ -50,7 +58,11 @@ translation:
   device_map: "auto"    # auto/cuda/cpu
   max_new_tokens: 100   # 最大生成token数
   temperature: 0.1      # 采样温度
-  target_languages:      # 目标翻译语言（源语言为 zh，zh→zh 无意义已移除，翻译耗时减半）
+  # 批量合并翻译：说话快于翻译时队列积压、译文越落越后；开启后把积压小句
+  # 合并成一批一次生成（无积压时不等待、零额外延迟）
+  batch_max_items: 6          # 单批最多合并的小句数（输出上限随之放大）
+  batch_max_new_tokens: 512   # 单批生成 token 上限（防单批过长拖慢节奏）
+  target_languages:      # 目标翻译语言（源语言为 zh，zh→zh 无意义已移除，翻译耗时减半；可在字幕浮窗右键"设置"中修改）
     - "en"  # 英语
 
 # 弹幕展示配置（display_mode: danmaku 时生效）

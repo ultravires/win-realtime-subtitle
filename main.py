@@ -53,6 +53,7 @@ class RealtimeSubtitleSystem:
         self._start_exit_watchdog()
 
         # 加载配置（CLI 覆盖项随后应用，优先级高于配置文件）
+        self.config_path = config_path
         self.config = load_config(config_path)
         for key, value in (overrides or {}).items():
             if value:
@@ -111,9 +112,38 @@ class RealtimeSubtitleSystem:
         else:
             self.display_manager = None  # console 模式不需要 GUI 管理器
 
+        # 设置入口：字幕浮窗右键"设置" → 声音来源/翻译语言可视化配置
+        if self.display_manager is not None and hasattr(self.display_manager,
+                                                        'set_settings_opener'):
+            self.display_manager.set_settings_opener(self._open_settings)
+
         # 数据队列
         self.text_queue = queue.Queue(maxsize=10)
         self.translation_queue = queue.Queue(maxsize=20)
+
+    def _open_settings(self):
+        """打开设置对话框（字幕浮窗右键"设置"触发，运行于 Qt 主线程）"""
+        try:
+            from danmaku.settings_dialog import SettingsDialog
+            parent = None
+            if self.display_manager is not None:
+                parent = getattr(self.display_manager, 'window', None)
+            dialog = SettingsDialog(
+                self.config,
+                config_path=self.config_path,
+                on_apply=self._apply_translation_languages,
+                parent=parent,
+            )
+            dialog.exec()
+        except Exception as e:
+            logger.error(f"设置对话框异常: {e}")
+
+    def _apply_translation_languages(self, langs: list):
+        """翻译语言热更新（设置对话框保存后回调）：内存配置与翻译器同步刷新"""
+        self.config['translation']['target_languages'] = list(langs)
+        if self.translator is not None:
+            self.translator.target_languages = list(langs)
+        logger.info(f"翻译目标语言已热更新: {langs or '（无）'}")
 
     def _init_translator(self):
         """初始化翻译器，带错误处理"""
@@ -599,9 +629,34 @@ def _print_audio_sources():
           "device 留空=系统默认设备；application 模式下 target_process 留空则启动时交互选择。")
 
 
+def _prepare_frozen_environment():
+    """PyInstaller 打包运行时的环境准备。
+
+    - 工作目录切到 exe 所在目录：config/ models/ logs/ 等相对路径随包部署
+    - 首次运行时释放程序包内置的默认配置到 config/config.yaml
+    （模型文件体积大，不随包分发，需放在 exe 旁的 models/ 目录；
+    HuggingFace 缓存沿用用户目录 ~/.cache/huggingface）
+    """
+    if not getattr(sys, 'frozen', False):
+        return
+    exe_dir = os.path.dirname(sys.executable)
+    os.chdir(exe_dir)
+    if not os.path.isfile('config/config.yaml'):
+        bundled = os.path.join(getattr(sys, '_MEIPASS', ''), 'config', 'config.yaml')
+        if os.path.isfile(bundled):
+            os.makedirs('config', exist_ok=True)
+            import shutil
+            shutil.copy2(bundled, 'config/config.yaml')
+            print("已释放默认配置: config/config.yaml")
+
+
 def main():
     """主函数"""
+    _prepare_frozen_environment()
+
     parser = argparse.ArgumentParser(description="实时多语言字幕系统")
+    parser.add_argument("--config", default="config/config.yaml",
+                        help="配置文件路径（默认 config/config.yaml）")
     parser.add_argument("--list-sources", action="store_true",
                         help="列出可用音频来源（设备与应用会话）后退出，不加载模型")
     parser.add_argument("--audio-source", choices=["microphone", "system", "application"],
@@ -624,7 +679,9 @@ def main():
         }
 
         # 创建系统实例
-        system = RealtimeSubtitleSystem(overrides=overrides, no_translate=args.no_translate)
+        system = RealtimeSubtitleSystem(config_path=args.config,
+                                        overrides=overrides,
+                                        no_translate=args.no_translate)
 
         # 启动系统
         system.start()

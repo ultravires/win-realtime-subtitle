@@ -13,6 +13,18 @@ def load_config(config_path: str = "config/config.yaml") -> dict:
         logger.error(f"配置文件加载失败: {e}")
         raise
 
+def save_config(config: dict, config_path: str = "config/config.yaml"):
+    """保存配置到 YAML 文件（界面设置写回用）。
+
+    yaml.safe_dump 会重写整个文件（原手工注释丢失，文件头已注明）。
+    """
+    header = ("# 实时字幕系统配置（可手工编辑，也可在字幕浮窗右键\"设置\"中修改）\n"
+              "# 注意：经界面保存会重新生成本文件，此前的手工注释会被覆盖。\n")
+    with open(config_path, 'w', encoding='utf-8') as f:
+        f.write(header)
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False,
+                       default_flow_style=False)
+
 def setup_logging(log_level: str = "INFO"):
     """设置日志配置"""
     logger.remove()  # 移除默认处理器
