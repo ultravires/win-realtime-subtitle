@@ -137,7 +137,14 @@ class TencentTranslator:
                 logger.warning(f"翻译预热失败（不影响运行）: {e}")
             
         except Exception as e:
+            # 打印完整 traceback 与 transformers 实际加载位置：
+            # PyInstaller 打包后 transformers 懒加载注册表的失败会把底层异常
+            # 包装成一条误导性消息（"Could not import module ..."），必须看全栈
+            import traceback
+            import transformers as _tf
             logger.error(f"翻译模型加载失败: {e}")
+            logger.error(f"transformers 加载自: {getattr(_tf, '__file__', '?')}")
+            logger.error(f"完整 traceback:\n{traceback.format_exc()}")
             raise
     
     def start_translation(self, text_queue: queue.Queue, translation_queue: queue.Queue):

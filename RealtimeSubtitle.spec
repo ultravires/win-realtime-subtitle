@@ -18,11 +18,20 @@
 
 import importlib.util
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 datas = [('config/config.yaml', 'config')]
 binaries = []
 hiddenimports = []
+
+# torchcodec 的模块会被 torchaudio/datasets 的导入链拉进 PYZ，transformers 的
+# audio_utils 在 import 时直接调 importlib.metadata.version("torchcodec")——
+# 模块在而 dist-info 元数据不在，版本查询抛 StopIteration，整条模型类导入链
+# 死亡（实测 HunYuanDenseV1ForCausalLM 报 "Could not import module ..."）。
+# 收集其 dist-info 元数据，让冻结环境与源码环境行为一致。
+if importlib.util.find_spec('torchcodec') is not None:
+    datas += copy_metadata('torchcodec')
+    print('[spec] 已收集 torchcodec dist-info 元数据')
 
 
 def add_package(name: str):
@@ -66,6 +75,13 @@ a = Analysis(
         'IPython',
         'pytest',
     ],
+    # transformers 懒加载注册表依赖 os.listdir(__path__) 扫描磁盘上的 .py 源文件
+    # 构建（transformers/utils/import_utils.py create_import_structure_from_path）。
+    # 若模块进 PYZ，__file__ 是 .pyc 路径，listdir 落空导致整个模型类注册表
+    # 崩塌（实测 HunYuanDenseV1ForCausalLM / Marian tokenizer 全部报
+    # "Could not import module ..."）。'py' 模式让整包以源文件落盘，
+    # 运行时从磁盘解析，与源码运行行为完全一致。
+    module_collection_mode={'transformers': 'py'},
     noarchive=False,
 )
 

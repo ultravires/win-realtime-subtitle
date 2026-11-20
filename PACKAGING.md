@@ -4,14 +4,32 @@
 
 ```bash
 pip install pyinstaller          # 仅构建机器需要
+python build_exe.py              # pyinstaller + 构建后修复（推荐）
+# 等价手动流程:
 pyinstaller --noconfirm RealtimeSubtitle.spec
+python build_exe.py --fix-only
 ```
 
 产物为 **onedir 目录形态**：`dist/RealtimeSubtitle/RealtimeSubtitle.exe`（外层 exe
 + `_internal/` 依赖目录）。不用 onefile：torch/transformers 依赖达数 GB，onefile
 每次启动要解压到临时目录，首启数分钟且翻倍占磁盘。
 
-构建日志在 `build_exe.log`；`build/` 与 `dist/` 已加入 .gitignore。
+## 两个必做的构建后处理（build_exe.py 自动执行）
+
+1. **删除 `_internal/PyQt6/Qt6/bin` 的旧版 VC 运行库**（MSVCP140/VCRUNTIME140/
+   VCRUNTIME140_1.dll）。PyQt6 的 runtime hook 会把 Qt6/bin 加入 DLL 搜索目录，
+   torch 的 c10.dll 会解析到 Qt 携带的旧版运行库 → DllMain 初始化失败
+   （WinError 1114）。删除后落到 _internal 根的 PyInstaller 副本/系统 redist。
+2. **transformers 以 'py' 模式落盘**（spec 的 `module_collection_mode`）。
+   transformers 懒加载注册表靠 `os.listdir(__path__)` 扫磁盘 .py 构建；进 PYZ
+   则注册表崩塌，所有模型类报 "Could not import module ..."。
+
+## 实测踩坑（勿回退）
+
+- `module_collection_mode={'transformers': 'py'}` 不能删：删了翻译模型
+  HunYuan 与所有 tokenizer 注册表在冻结环境全部失效
+- Qt6/bin 三个 VC 运行库 DLL 不能留：删了之后 torch CUDA 导入成功
+- bitsandbytes 的 cuda118 DLL 依赖告警可忽略（量化配置为 none 不加载）
 
 ## 分发内容
 

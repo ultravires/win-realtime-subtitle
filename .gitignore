@@ -23,3 +23,5 @@ build/
 dist/
 *.spec.bak
 build_exe.log
+build_exe*.log
+test_pipeline_run.log
