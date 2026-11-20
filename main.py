@@ -28,7 +28,8 @@ SHUTDOWN_FORCE_EXIT_SEC = 20.0
 class RealtimeSubtitleSystem:
     """实时字幕系统主类 - 优化版本"""
 
-    def __init__(self, config_path: str = "config/config.yaml", overrides: dict = None):
+    def __init__(self, config_path: str = "config/config.yaml", overrides: dict = None,
+                 no_translate: bool = False):
         # ---- 退出状态标志：必须最先定义（信号处理器/看门狗任何时刻都可能访问）----
         self.running = False
         self._stopped = False
@@ -58,6 +59,13 @@ class RealtimeSubtitleSystem:
                 self.config['audio'][key] = value
                 logger.info(f"CLI 覆盖音频配置: audio.{key} = {value}")
 
+        # 翻译开关：CLI --no-translate 优先于配置文件 translation.enabled。
+        # 禁用时不加载翻译模型（省 ~15GB 显存与模型加载耗时），仅显示识别原文
+        self.translation_enabled = (
+            not no_translate
+            and self.config['translation'].get('enabled', True)
+        )
+
         # 设置日志（尽早，保证后续每个阶段都有输出）
         setup_logging(self.config['system']['log_level'])
         logger.info(f"配置加载完成 ({config_path})")
@@ -68,8 +76,10 @@ class RealtimeSubtitleSystem:
         from audio_capture.audio_capturer import AudioCapturer
         from transcription.whisper_transcriber import WhisperTranscriber
         from transcription.streaming_transcriber import StreamingTranscriber
-        from translation.translator import TencentTranslator
-        from translation.simple_translator import SimpleTranslator
+        if self.translation_enabled:
+            # 翻译禁用时跳过 torch/transformers 链路导入（sherpa-stream 后端本身不依赖 torch）
+            from translation.translator import TencentTranslator
+            from translation.simple_translator import SimpleTranslator
         from danmaku.danmaku_window import DanmakuManager
         from danmaku.subtitle_window import SubtitleManager
         logger.info(f"依赖导入完成，耗时 {time.time() - t0:.1f}s")
@@ -84,8 +94,13 @@ class RealtimeSubtitleSystem:
             self.whisper_transcriber = WhisperTranscriber(self.config)
             logger.info("识别后端: faster-whisper 窗口式")
 
-        # 尝试初始化腾讯翻译器，失败则使用简化版
-        self.translator = self._init_translator()
+        # 翻译器：按开关初始化；禁用时保持 None，start() 会走无翻译直通模式
+        if self.translation_enabled:
+            # 尝试初始化腾讯翻译器，失败则使用简化版
+            self.translator = self._init_translator()
+        else:
+            self.translator = None
+            logger.info("翻译已禁用（--no-translate 或 translation.enabled: false），仅显示识别原文")
 
         # 字幕显示管理器：按 display_mode 创建（subtitle 字幕浮窗 / danmaku 弹幕 / console 控制台）
         display_mode = self.config['system'].get('display_mode', 'subtitle')
@@ -593,6 +608,8 @@ def main():
                         help="覆盖配置文件中的 audio.source")
     parser.add_argument("--audio-device", help="覆盖 audio.device（设备名子串，留空=默认设备）")
     parser.add_argument("--audio-target", help="覆盖 audio.target_process（application 模式的进程名/PID）")
+    parser.add_argument("--no-translate", action="store_true",
+                        help="不加载翻译模型，仅显示识别原文（启动更快、省显存；优先于配置文件）")
     args = parser.parse_args()
 
     try:
@@ -607,7 +624,7 @@ def main():
         }
 
         # 创建系统实例
-        system = RealtimeSubtitleSystem(overrides=overrides)
+        system = RealtimeSubtitleSystem(overrides=overrides, no_translate=args.no_translate)
 
         # 启动系统
         system.start()

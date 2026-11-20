@@ -44,6 +44,7 @@ streaming:
 
 # 翻译模型配置
 translation:
+  enabled: true  # false = 不加载翻译模型，仅显示识别原文（省显存、启动更快；CLI --no-translate 可临时覆盖）
   model_name: "tencent/HY-MT1.5-7B"
   quantization: "none"  # 注意：HY-MT 为 trust_remote_code 自定义模型，bnb 4bit/8bit 会被静默忽略（实测仍 fp16 ~14.8GB）；显存不足时只能换更小的翻译模型
   device_map: "auto"    # auto/cuda/cpu

@@ -55,6 +55,9 @@ run.bat
 
 # 或直接运行
 python main.py
+
+# 仅显示识别原文：不加载翻译模型，启动更快、省约 15GB 显存
+python main.py --no-translate
 ```
 
 3. **系统启动后**（默认 `display_mode: "danmaku"`）
